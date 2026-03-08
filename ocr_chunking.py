@@ -1,4 +1,4 @@
-"""
+﻿"""
 OCR + chunking + embeddings orchestrator (FastAPI/OpenAPI, psycopg2, no plpy).
 
 Main goals:
@@ -518,54 +518,20 @@ class PostgresClient:
         """
         return self.query_one(sql, (int(job_id),))
 
-    def count_existing_embeddings(
-        self,
-        documento_id: Optional[int],
-        job_file_id: Optional[int],
-        model_name: str,
-        scope: str,
-    ) -> int:
-        """Counts existing embeddings depending on overwrite scope."""
+    def count_existing_embeddings(self, documento_id: Optional[int]) -> int:
+        """Counts existing embeddings for one documentoId (overwrite a nivel documento)."""
         if documento_id is None:
             return 0
-        if scope == "job_file" and job_file_id is not None:
-            row = self.query_one(
-                'SELECT COUNT(*)::int AS c FROM "IaCore"."Embeddings" WHERE "documentoId" = %s AND "jobFileId" = %s',
-                (int(documento_id), int(job_file_id)),
-            )
-            return int(row["c"]) if row else 0
-        if scope == "documento_modelo":
-            row = self.query_one(
-                'SELECT COUNT(*)::int AS c FROM "IaCore"."Embeddings" WHERE "documentoId" = %s AND "modelo" = %s',
-                (int(documento_id), model_name),
-            )
-            return int(row["c"]) if row else 0
         row = self.query_one(
             'SELECT COUNT(*)::int AS c FROM "IaCore"."Embeddings" WHERE "documentoId" = %s',
             (int(documento_id),),
         )
         return int(row["c"]) if row else 0
 
-    def delete_existing_embeddings(
-        self,
-        documento_id: Optional[int],
-        job_file_id: Optional[int],
-        model_name: str,
-        scope: str,
-    ) -> int:
-        """Deletes existing embeddings depending on overwrite scope."""
+    def delete_existing_embeddings(self, documento_id: Optional[int]) -> int:
+        """Deletes existing embeddings for one documentoId (overwrite a nivel documento)."""
         if documento_id is None:
             return 0
-        if scope == "job_file" and job_file_id is not None:
-            return self.execute(
-                'DELETE FROM "IaCore"."Embeddings" WHERE "documentoId" = %s AND "jobFileId" = %s',
-                (int(documento_id), int(job_file_id)),
-            )
-        if scope == "documento_modelo":
-            return self.execute(
-                'DELETE FROM "IaCore"."Embeddings" WHERE "documentoId" = %s AND "modelo" = %s',
-                (int(documento_id), model_name),
-            )
         return self.execute(
             'DELETE FROM "IaCore"."Embeddings" WHERE "documentoId" = %s',
             (int(documento_id),),
@@ -621,21 +587,20 @@ class QueueOptions(BaseModel):
     """Queue options."""
 
     enabled: bool = Field(default=True, description="Enable queue controls.")
-    name: str = Field(default=DEFAULT_QUEUE_NAME, description="Queue name in Operaciones.ColasProcesamiento.")
-    job_type: str = Field(default=DEFAULT_JOB_TYPE, description="Job type in Operaciones.JobsProcesamiento.")
-    description: str = Field(default="OCR+Chunking+Embeddings queue")
     max_concurrency: int = Field(default=2, ge=1, le=64)
-    timeout_seconds: int = Field(default=DEFAULT_TIMEOUT_SECONDS, ge=60, le=21600)
-    retries_max: int = Field(default=3, ge=1, le=20)
-    priority_default: int = Field(default=40, ge=1, le=1000)
-    queue_when_busy: bool = Field(default=True, description="If queue busy, create pending job.")
+    queue_when_busy: bool = Field(
+        default=True,
+        description="Si la cola esta ocupada, crea job PENDIENTE (ENQUEUED) en lugar de fallar.",
+    )
 
 
 class OverwriteOptions(BaseModel):
-    """Overwrite options for duplicate embeddings."""
+    """Overwrite options for duplicate embeddings (siempre a nivel documento)."""
 
-    enabled: bool = Field(default=False, description="Allow overwrite.")
-    scope: str = Field(default="documento_modelo", description="documento | documento_modelo | job_file")
+    enabled: bool = Field(
+        default=False,
+        description="Si true, borra embeddings existentes del documento antes de insertar.",
+    )
 
 
 class ExtractionOptions(BaseModel):
@@ -660,19 +625,20 @@ class CleaningOptions(BaseModel):
     remove_headers: bool = Field(default=True)
     remove_isolated_numbers: bool = Field(default=True)
     header_threshold: int = Field(default=3, ge=2, le=20)
-    fix_reversed_tokens: bool = Field(default=False)
 
 
 class ChunkingOptions(BaseModel):
     """Chunking options."""
 
     strategy: str = Field(default="semantic", description="semantic | simple")
-    target_chunks: Optional[int] = Field(default=None, ge=1)
     max_chunks: int = Field(default=0, ge=0, description="0 means unlimited.")
     simple_chunk_size: int = Field(default=1500, ge=100, le=50000)
     simple_chunk_overlap: int = Field(default=200, ge=0, le=10000)
     min_text_chars: int = Field(default=50, ge=1, le=100000)
-    enable_simple_fallback: bool = Field(default=True)
+    enable_simple_fallback: bool = Field(
+        default=False,
+        description="Si true y semantic no genera chunks, usa simple chunking como fallback.",
+    )
 
 
 class EmbeddingOptions(BaseModel):
@@ -680,8 +646,12 @@ class EmbeddingOptions(BaseModel):
 
     enabled: bool = Field(default=True)
     model_name: str = Field(default=DEFAULT_EMBEDDING_MODEL)
-    max_length: int = Field(default=512, ge=16, le=8192)
-    batch_size: int = Field(default=8, ge=1, le=256)
+    batch_size: int = Field(
+        default=8,
+        ge=1,
+        le=256,
+        description="Cantidad de chunks procesados por lote al generar embeddings.",
+    )
     save_to_db: bool = Field(default=True)
     return_vectors: bool = Field(default=False)
     require_documento_id: bool = Field(default=True)
@@ -704,12 +674,18 @@ class OCRChunkingRequest(BaseModel):
     oid: int = Field(..., description="Required pg_largeobject OID.")
     file_name: Optional[str] = Field(default=None, description="Optional file name; if missing, resolve by loOid.")
     documento_id: Optional[int] = Field(default=None)
-    job_file_id: Optional[int] = Field(default=None)
-    item_id: Optional[int] = Field(default=None)
+    job_filde_id: Optional[int] = Field(
+        default=None,
+        description="Id de archivo/job para trazabilidad (compatibilidad con nombre solicitado).",
+    )
     created_by: Optional[int] = Field(default=None)
-    metadata: Dict[str, Any] = Field(default_factory=dict)
-    execution_mode: str = Field(default="sync", description="sync | enqueue")
-    timeout_seconds: int = Field(default=DEFAULT_TIMEOUT_SECONDS, ge=30, le=21600)
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Metadata del documento. Recomendado: nombre_documento, metadata_documento"
+            " (ej: paginas, idioma) y ruta_pdf."
+        ),
+    )
     queue: QueueOptions = Field(default_factory=QueueOptions)
     overwrite: OverwriteOptions = Field(default_factory=OverwriteOptions)
     extraction: ExtractionOptions = Field(default_factory=ExtractionOptions)
@@ -724,18 +700,19 @@ class OCRChunkingRequest(BaseModel):
                 "oid": 2299268,
                 "file_name": None,
                 "documento_id": 7788,
-                "job_file_id": 4567,
-                "item_id": 2,
+                "job_filde_id": 4567,
                 "created_by": 1101,
-                "metadata": {"fuente": "ANH", "proceso": "ocr_chunking"},
-                "execution_mode": "sync",
+                "metadata": {
+                    "nombre_documento": "CTO_EyP_LLA_50_2013.pdf",
+                    "metadata_documento": {"paginas": 133, "idioma": "es"},
+                    "ruta_pdf": "\\\\servidor\\share\\CTO_EyP_LLA_50_2013.pdf",
+                },
                 "queue": {
                     "enabled": True,
-                    "name": "BRAINVT_OCR_EMBEDDINGS_GPU",
-                    "job_type": "BRAINVT_OCR_EMBEDDINGS_GPU",
+                    "max_concurrency": 2,
                     "queue_when_busy": True,
                 },
-                "overwrite": {"enabled": False, "scope": "documento_modelo"},
+                "overwrite": {"enabled": False},
                 "extraction": {
                     "engine": "auto",
                     "enable_pymupdf_fast_path": True,
@@ -745,7 +722,7 @@ class OCRChunkingRequest(BaseModel):
                     "tail_pages": 8,
                 },
                 "cleaning": {"enabled": True, "remove_headers": True, "remove_isolated_numbers": True},
-                "chunking": {"strategy": "semantic", "target_chunks": None, "max_chunks": 0},
+                "chunking": {"strategy": "semantic", "max_chunks": 0, "enable_simple_fallback": False},
                 "embedding": {
                     "enabled": True,
                     "model_name": "intfloat/multilingual-e5-large-instruct",
@@ -761,10 +738,13 @@ class OCRChunkingRequest(BaseModel):
 class OCRChunkingResponse(BaseModel):
     """Output response model."""
 
-    status: str
+    status: str = Field(description="COMPLETED | ENQUEUED | FAILED")
     exitoso: bool
     message: str
-    error: Optional[Dict[str, Any]] = None
+    error: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Error estructurado: phase, code, message, details.",
+    )
     phases: List[Dict[str, Any]] = Field(default_factory=list)
     data: Dict[str, Any] = Field(default_factory=dict)
 
@@ -998,30 +978,6 @@ def clean_text(text: str, cleaning: CleaningOptions) -> Tuple[str, Dict[str, Any
     if cleaning.remove_isolated_numbers:
         lines = [line for line in lines if not ISOLATED_NUMBER_PATTERN.match(line.strip()) or not line.strip()]
 
-    reverse_fix_count = 0
-    if cleaning.fix_reversed_tokens:
-        fixed_lines: List[str] = []
-        for line in lines:
-            parts = re.split(r"(\s+)", line)
-            rebuilt: List[str] = []
-            for token in parts:
-                if not token or token.isspace():
-                    rebuilt.append(token)
-                    continue
-                fixed = token
-                if len(token) >= 6 and token.isalpha():
-                    vowel_count = sum(1 for c in token if c.lower() in {"a", "e", "i", "o", "u"})
-                    if vowel_count == 0:
-                        candidate = token[::-1]
-                        candidate_vowels = sum(1 for c in candidate if c.lower() in {"a", "e", "i", "o", "u"})
-                        if candidate_vowels >= 2:
-                            fixed = candidate
-                if fixed != token:
-                    reverse_fix_count += 1
-                rebuilt.append(fixed)
-            fixed_lines.append("".join(rebuilt))
-        lines = fixed_lines
-
     merged = "\n".join(lines)
     merged = MULTI_EMPTY_LINES_PATTERN.sub("\n\n", merged).strip()
     return merged, {
@@ -1030,8 +986,6 @@ def clean_text(text: str, cleaning: CleaningOptions) -> Tuple[str, Dict[str, Any
         "chars_after": len(merged),
         "remove_headers": bool(cleaning.remove_headers),
         "remove_isolated_numbers": bool(cleaning.remove_isolated_numbers),
-        "fix_reversed_tokens": bool(cleaning.fix_reversed_tokens),
-        "reverse_fix_count": int(reverse_fix_count),
     }
 
 
@@ -1220,19 +1174,28 @@ def gpu_metrics() -> Dict[str, Any]:
     }
 
 
-def build_job_payload(request: OCRChunkingRequest, file_name: str, item_info: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def derive_embedding_max_length(chunking: ChunkingOptions) -> int:
+    """Deriva max_length para embeddings a partir de la estrategia de chunking."""
+    approx_from_chars = max(128, int(chunking.simple_chunk_size / 4))
+    return min(2048, approx_from_chars)
+
+
+def build_job_payload(
+    request: OCRChunkingRequest,
+    file_name: str,
+    item_info: Optional[Dict[str, Any]],
+    stage: str,
+) -> Dict[str, Any]:
     """Builds compact payload for Operaciones.JobsProcesamiento."""
     return {
         "pipeline": "OCR_CHUNKING_SERVICE",
+        "stage": stage,
         "oid": int(request.oid),
         "file_name": file_name,
         "documento_id": request.documento_id,
-        "job_file_id": request.job_file_id,
-        "item_id": request.item_id,
-        "execution_mode": request.execution_mode,
-        "queue_name": request.queue.name,
+        "job_filde_id": request.job_filde_id,
+        "queue_name": DEFAULT_QUEUE_NAME,
         "overwrite_enabled": request.overwrite.enabled,
-        "overwrite_scope": request.overwrite.scope,
         "metadata": request.metadata,
         "resolved_item": item_info or {},
         "created_at_utc": utc_now_iso(),
@@ -1317,19 +1280,33 @@ def run_mock_pipeline(request: OCRChunkingRequest) -> OCRChunkingResponse:
         )
 
 
-def run_real_pipeline(request: OCRChunkingRequest) -> OCRChunkingResponse:
-    """Runs full real pipeline against DB and model runtime."""
+def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> OCRChunkingResponse:
+    """Runs selected stage (ocr/chunking/embedding/pipeline) against DB and model runtime."""
+    stage_key = safe_str(stage, "pipeline").strip().lower()
+    if stage_key not in {"ocr", "chunking", "embedding", "pipeline"}:
+        raise PipelineError(
+            "REQUEST_VALIDATION",
+            "INVALID_STAGE",
+            "Etapa invalida. Usa: ocr, chunking, embedding o pipeline.",
+            {"stage": stage},
+        )
+
+    run_chunking_stage = stage_key in {"chunking", "embedding", "pipeline"}
+    run_embedding_stage = stage_key in {"embedding", "pipeline"} and request.embedding.enabled
+    run_persist_stage = stage_key in {"embedding", "pipeline"} and request.embedding.save_to_db
+
     started = time.monotonic()
     recorder = PhaseRecorder()
     queue_slot_acquired = False
-    queue_name = request.queue.name
+    queue_name = DEFAULT_QUEUE_NAME
+    job_type = DEFAULT_JOB_TYPE if stage_key == "pipeline" else f"{DEFAULT_JOB_TYPE}_{stage_key.upper()}"
     job_id: Optional[int] = None
     item_info: Optional[Dict[str, Any]] = None
     file_name = safe_str(request.file_name, "").strip()
 
-    recorder.push("REQUEST_VALIDATION", "OK", "Request recibida.", {"oid": int(request.oid)})
+    recorder.push("REQUEST_VALIDATION", "OK", "Request recibida.", {"oid": int(request.oid), "stage": stage_key})
 
-    if request.embedding.save_to_db and not request.embedding.enabled:
+    if run_persist_stage and not request.embedding.enabled:
         err = PipelineError(
             "REQUEST_VALIDATION",
             "INVALID_EMBEDDING_CONFIG",
@@ -1342,19 +1319,7 @@ def run_real_pipeline(request: OCRChunkingRequest) -> OCRChunkingResponse:
             message="Configuracion invalida.",
             error=err.to_dict(),
             phases=recorder.as_list(),
-            data={"oid": int(request.oid)},
-        )
-
-    if request.execution_mode not in {"sync", "enqueue"}:
-        err = PipelineError("REQUEST_VALIDATION", "INVALID_EXECUTION_MODE", "execution_mode debe ser sync o enqueue.")
-        recorder.push(err.phase, "ERROR", err.message, err.details)
-        return OCRChunkingResponse(
-            status="FAILED",
-            exitoso=False,
-            message="Configuracion invalida.",
-            error=err.to_dict(),
-            phases=recorder.as_list(),
-            data={"oid": int(request.oid)},
+            data={"oid": int(request.oid), "stage": stage_key},
         )
 
     try:
@@ -1385,48 +1350,17 @@ def run_real_pipeline(request: OCRChunkingRequest) -> OCRChunkingResponse:
             if request.queue.enabled:
                 queue_info = db.ensure_queue(
                     queue_name=queue_name,
-                    description=request.queue.description,
+                    description=f"Servicio {stage_key} OCR/Chunking/Embeddings",
                     max_concurrency=request.queue.max_concurrency,
-                    timeout_seconds=request.queue.timeout_seconds,
-                    retries_max=request.queue.retries_max,
-                    priority_default=request.queue.priority_default,
+                    timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
+                    retries_max=3,
+                    priority_default=40,
                 )
                 recorder.push("QUEUE_SETUP", "OK", "Queue asegurada.", {"queue": queue_info})
             else:
                 recorder.push("QUEUE_SETUP", "SKIPPED", "Queue deshabilitada.")
 
-            payload = build_job_payload(request, file_name, item_info)
-
-            if request.execution_mode == "enqueue":
-                job_id = db.create_job(
-                    job_type=request.queue.job_type,
-                    estado="PENDIENTE",
-                    prioridad=request.queue.priority_default,
-                    documento_id=request.documento_id,
-                    parametros=payload,
-                    max_intentos=request.queue.retries_max,
-                )
-                if request.queue.enabled:
-                    db.refresh_queue_stats(queue_name)
-                recorder.push(
-                    "QUEUE_ENQUEUE",
-                    "ENQUEUED",
-                    "Job encolado en modo enqueue.",
-                    {"job_id": job_id, "queue_name": queue_name},
-                )
-                return OCRChunkingResponse(
-                    status="ENQUEUED",
-                    exitoso=True,
-                    message="Job encolado correctamente.",
-                    phases=recorder.as_list(),
-                    data={
-                        "oid": int(request.oid),
-                        "job_id": job_id,
-                        "queue_name": queue_name if request.queue.enabled else None,
-                        "file_name": file_name,
-                        "item_id": safe_int(item_info.get("item_id"), None),
-                    },
-                )
+            payload = build_job_payload(request, file_name, item_info, stage_key)
 
             if request.queue.enabled:
                 slot = db.acquire_queue_slot(queue_name)
@@ -1434,12 +1368,12 @@ def run_real_pipeline(request: OCRChunkingRequest) -> OCRChunkingResponse:
                 if not queue_slot_acquired:
                     if request.queue.queue_when_busy:
                         job_id = db.create_job(
-                            job_type=request.queue.job_type,
+                            job_type=job_type,
                             estado="PENDIENTE",
-                            prioridad=request.queue.priority_default,
+                            prioridad=40,
                             documento_id=request.documento_id,
                             parametros=payload,
-                            max_intentos=request.queue.retries_max,
+                            max_intentos=3,
                         )
                         db.refresh_queue_stats(queue_name)
                         recorder.push(
@@ -1455,6 +1389,7 @@ def run_real_pipeline(request: OCRChunkingRequest) -> OCRChunkingResponse:
                             phases=recorder.as_list(),
                             data={
                                 "oid": int(request.oid),
+                                "stage": stage_key,
                                 "job_id": job_id,
                                 "queue_name": queue_name,
                                 "queue_state": slot.get("queue"),
@@ -1475,12 +1410,12 @@ def run_real_pipeline(request: OCRChunkingRequest) -> OCRChunkingResponse:
                 )
 
             job_id = db.create_job(
-                job_type=request.queue.job_type,
+                job_type=job_type,
                 estado="EN_PROCESO",
-                prioridad=request.queue.priority_default,
+                prioridad=40,
                 documento_id=request.documento_id,
                 parametros=payload,
-                max_intentos=request.queue.retries_max,
+                max_intentos=3,
             )
             update_job_progress(db, job_id, recorder, "RUNNING", "QUEUE_ADMISSION", {"job_id": job_id})
 
@@ -1536,120 +1471,74 @@ def run_real_pipeline(request: OCRChunkingRequest) -> OCRChunkingResponse:
             recorder.push("TEXT_CLEANING", "OK", "Limpieza aplicada.", cleaning_meta)
             update_job_progress(db, job_id, recorder, "RUNNING", "TEXT_CLEANING")
 
-            documento_id = request.documento_id
-            if request.embedding.save_to_db and request.embedding.require_documento_id and documento_id is None:
-                raise PipelineError(
-                    "OVERWRITE_CHECK",
-                    "DOCUMENTO_ID_REQUIRED",
-                    "documento_id es obligatorio para persistir embeddings.",
-                )
-
-            existing_count = 0
-            deleted_count = 0
-            if request.embedding.save_to_db:
-                existing_count = db.count_existing_embeddings(
-                    documento_id=documento_id,
-                    job_file_id=request.job_file_id,
-                    model_name=request.embedding.model_name,
-                    scope=request.overwrite.scope,
-                )
-                if existing_count > 0 and not request.overwrite.enabled:
+            chunks: List[str] = []
+            bounds: List[Tuple[int, int]] = []
+            chunking_method = "none"
+            if run_chunking_stage:
+                chunk_strategy = safe_str(request.chunking.strategy, "semantic").strip().lower()
+                if chunk_strategy not in {"semantic", "simple"}:
                     raise PipelineError(
-                        "OVERWRITE_CHECK",
-                        "DUPLICATE_EMBEDDINGS",
-                        "Ya existen embeddings y overwrite.enabled=false.",
-                        {
-                            "documento_id": documento_id,
-                            "job_file_id": request.job_file_id,
-                            "scope": request.overwrite.scope,
-                            "existing_count": existing_count,
-                        },
+                        "CHUNKING",
+                        "INVALID_CHUNKING_STRATEGY",
+                        "chunking.strategy debe ser semantic o simple.",
+                        {"strategy": request.chunking.strategy},
                     )
-                if existing_count > 0 and request.overwrite.enabled:
-                    deleted_count = db.delete_existing_embeddings(
-                        documento_id=documento_id,
-                        job_file_id=request.job_file_id,
-                        model_name=request.embedding.model_name,
-                        scope=request.overwrite.scope,
-                    )
-            recorder.push(
-                "OVERWRITE_CHECK",
-                "OK",
-                "Validacion de duplicados completada.",
-                {
-                    "existing_count": existing_count,
-                    "overwrite_enabled": bool(request.overwrite.enabled),
-                    "deleted_count": deleted_count,
-                    "scope": request.overwrite.scope,
-                },
-            )
-            update_job_progress(db, job_id, recorder, "RUNNING", "OVERWRITE_CHECK")
-
-            chunk_strategy = safe_str(request.chunking.strategy, "semantic").strip().lower()
-            if chunk_strategy not in {"semantic", "simple"}:
-                raise PipelineError(
-                    "CHUNKING",
-                    "INVALID_CHUNKING_STRATEGY",
-                    "chunking.strategy debe ser semantic o simple.",
-                    {"strategy": request.chunking.strategy},
-                )
-            chunks: List[str]
-            chunking_method = chunk_strategy
-            if chunk_strategy == "semantic":
-                tokenizer_for_chunk = load_tokenizer(request.embedding.model_name)
-                chunks = semantic_chunk_text(text_for_chunking, tokenizer_for_chunk)
-                if not chunks and request.chunking.enable_simple_fallback:
+                chunking_method = chunk_strategy
+                if chunk_strategy == "semantic":
+                    tokenizer_for_chunk = load_tokenizer(request.embedding.model_name)
+                    chunks = semantic_chunk_text(text_for_chunking, tokenizer_for_chunk)
+                    if not chunks and request.chunking.enable_simple_fallback:
+                        chunks = simple_chunk_text(
+                            text_for_chunking,
+                            request.chunking.simple_chunk_size,
+                            request.chunking.simple_chunk_overlap,
+                        )
+                        chunking_method = "simple_fallback"
+                else:
                     chunks = simple_chunk_text(
                         text_for_chunking,
                         request.chunking.simple_chunk_size,
                         request.chunking.simple_chunk_overlap,
                     )
-                    chunking_method = "simple_fallback"
-            else:
-                chunks = simple_chunk_text(
-                    text_for_chunking,
-                    request.chunking.simple_chunk_size,
-                    request.chunking.simple_chunk_overlap,
-                )
 
-            chunks = rebalance_chunks(chunks, request.chunking.target_chunks)
-            if request.chunking.max_chunks > 0:
-                chunks = chunks[: int(request.chunking.max_chunks)]
-            chunks = [chunk for chunk in chunks if chunk.strip()]
-
-            if not chunks:
-                raise PipelineError("CHUNKING", "EMPTY_CHUNKS", "No se generaron chunks.")
-            if len(text_for_chunking) < int(request.chunking.min_text_chars):
+                if request.chunking.max_chunks > 0:
+                    chunks = chunks[: int(request.chunking.max_chunks)]
+                chunks = [chunk for chunk in chunks if chunk.strip()]
+                if not chunks:
+                    raise PipelineError("CHUNKING", "EMPTY_CHUNKS", "No se generaron chunks.")
+                if len(text_for_chunking) < int(request.chunking.min_text_chars):
+                    recorder.push(
+                        "CHUNKING_WARNING",
+                        "WARN",
+                        "Texto menor al umbral min_text_chars; se continua con los chunks disponibles.",
+                        {
+                            "min_text_chars": int(request.chunking.min_text_chars),
+                            "text_chars": len(text_for_chunking),
+                        },
+                    )
+                bounds = estimate_bounds(text_for_chunking, chunks)
                 recorder.push(
-                    "CHUNKING_WARNING",
-                    "WARN",
-                    "Texto menor al umbral min_text_chars; se continua con los chunks disponibles.",
-                    {
-                        "min_text_chars": int(request.chunking.min_text_chars),
-                        "text_chars": len(text_for_chunking),
-                    },
+                    "CHUNKING",
+                    "OK",
+                    "Chunking completado.",
+                    {"strategy": chunking_method, "chunks_count": len(chunks)},
                 )
-
-            bounds = estimate_bounds(text_for_chunking, chunks)
-            recorder.push(
-                "CHUNKING",
-                "OK",
-                "Chunking completado.",
-                {"strategy": chunking_method, "chunks_count": len(chunks)},
-            )
-            update_job_progress(db, job_id, recorder, "RUNNING", "CHUNKING")
+                update_job_progress(db, job_id, recorder, "RUNNING", "CHUNKING")
+            else:
+                recorder.push("CHUNKING", "SKIPPED", "Etapa no solicitada para este endpoint.")
 
             vectors: List[List[float]] = []
             tokens_per_chunk: List[int] = [0 for _ in chunks]
             embedding_device = "none"
-            if request.embedding.enabled:
+            if run_embedding_stage:
                 tokenizer, model, device = load_embedding_model(request.embedding.model_name)
+                derived_max_length = derive_embedding_max_length(request.chunking)
                 vectors, tokens_per_chunk = embed_chunks(
                     chunks=chunks,
                     tokenizer=tokenizer,
                     model=model,
                     device=device,
-                    max_length=request.embedding.max_length,
+                    max_length=derived_max_length,
                     batch_size=request.embedding.batch_size,
                 )
                 embedding_device = device
@@ -1660,16 +1549,50 @@ def run_real_pipeline(request: OCRChunkingRequest) -> OCRChunkingResponse:
                         "La cantidad de embeddings no coincide con chunks.",
                         {"chunks": len(chunks), "vectors": len(vectors)},
                     )
-            recorder.push(
-                "EMBEDDINGS",
-                "OK",
-                "Embeddings generados.",
-                {"enabled": request.embedding.enabled, "device": embedding_device, "vectors": len(vectors)},
-            )
-            update_job_progress(db, job_id, recorder, "RUNNING", "EMBEDDINGS")
+                recorder.push(
+                    "EMBEDDINGS",
+                    "OK",
+                    "Embeddings generados.",
+                    {"enabled": True, "device": embedding_device, "vectors": len(vectors)},
+                )
+                update_job_progress(db, job_id, recorder, "RUNNING", "EMBEDDINGS")
+            else:
+                recorder.push("EMBEDDINGS", "SKIPPED", "Etapa no solicitada para este endpoint.")
 
             inserted_rows = 0
-            if request.embedding.save_to_db:
+            if run_persist_stage:
+                documento_id = request.documento_id
+                if request.embedding.require_documento_id and documento_id is None:
+                    raise PipelineError(
+                        "OVERWRITE_CHECK",
+                        "DOCUMENTO_ID_REQUIRED",
+                        "documento_id es obligatorio para persistir embeddings.",
+                    )
+
+                existing_count = db.count_existing_embeddings(documento_id=documento_id)
+                deleted_count = 0
+                if existing_count > 0 and not request.overwrite.enabled:
+                    raise PipelineError(
+                        "OVERWRITE_CHECK",
+                        "DUPLICATE_EMBEDDINGS",
+                        "Ya existen embeddings para el documento y overwrite.enabled=false.",
+                        {"documento_id": documento_id, "existing_count": existing_count},
+                    )
+                if existing_count > 0 and request.overwrite.enabled:
+                    deleted_count = db.delete_existing_embeddings(documento_id=documento_id)
+
+                recorder.push(
+                    "OVERWRITE_CHECK",
+                    "OK",
+                    "Validacion de duplicados completada.",
+                    {
+                        "existing_count": existing_count,
+                        "overwrite_enabled": bool(request.overwrite.enabled),
+                        "deleted_count": deleted_count,
+                    },
+                )
+                update_job_progress(db, job_id, recorder, "RUNNING", "OVERWRITE_CHECK")
+
                 created_by = request.created_by if request.created_by is not None else request.embedding.created_by_default
                 row_values: List[Tuple[Any, ...]] = []
                 for idx, chunk in enumerate(chunks):
@@ -1695,13 +1618,14 @@ def run_real_pipeline(request: OCRChunkingRequest) -> OCRChunkingResponse:
                             chunk,
                             int(created_by),
                             documento_id,
-                            request.job_file_id,
+                            request.job_filde_id,
                             json.dumps(metadata_row, ensure_ascii=False),
                             request.embedding.model_name,
                             int(tokens_per_chunk[idx]) if idx < len(tokens_per_chunk) else 0,
                             vector_literal,
                         )
                     )
+
                 inserted_rows = db.insert_embeddings(row_values)
                 if request.embedding.require_inserted_rows and inserted_rows <= 0:
                     raise PipelineError(
@@ -1709,23 +1633,25 @@ def run_real_pipeline(request: OCRChunkingRequest) -> OCRChunkingResponse:
                         "NO_ROWS_INSERTED",
                         "No se insertaron embeddings y require_inserted_rows=true.",
                     )
-
-            recorder.push(
-                "PERSIST",
-                "OK",
-                "Persistencia completada.",
-                {"inserted_rows": inserted_rows, "save_to_db": request.embedding.save_to_db},
-            )
-            update_job_progress(db, job_id, recorder, "RUNNING", "PERSIST")
+                recorder.push(
+                    "PERSIST",
+                    "OK",
+                    "Persistencia completada.",
+                    {"inserted_rows": inserted_rows, "save_to_db": True},
+                )
+                update_job_progress(db, job_id, recorder, "RUNNING", "PERSIST")
+            else:
+                recorder.push("PERSIST", "SKIPPED", "Persistencia no solicitada para este endpoint.")
 
             elapsed_ms = int((time.monotonic() - started) * 1000)
             result_data = {
                 "oid": int(request.oid),
+                "stage": stage_key,
                 "job_id": job_id,
                 "file_name": file_name,
                 "item_id": safe_int(item_info.get("item_id"), None),
-                "documento_id": documento_id,
-                "job_file_id": request.job_file_id,
+                "documento_id": request.documento_id,
+                "job_filde_id": request.job_filde_id,
                 "queue_name": queue_name if request.queue.enabled else None,
                 "binary_sha256": binary_sha256,
                 "engine_used": engine,
@@ -1737,7 +1663,12 @@ def run_real_pipeline(request: OCRChunkingRequest) -> OCRChunkingResponse:
                 "gpu": gpu_metrics(),
                 "elapsed_ms": elapsed_ms,
             }
-            if request.embedding.return_vectors:
+            if stage_key == "ocr":
+                result_data["ocr_text_chars"] = len(text_for_chunking)
+                result_data["ocr_preview"] = text_for_chunking[:500]
+            if stage_key == "chunking":
+                result_data["chunks_preview"] = chunks[:5]
+            if request.embedding.return_vectors and vectors:
                 result_data["vectors"] = vectors
 
             final_payload = {
@@ -1759,7 +1690,7 @@ def run_real_pipeline(request: OCRChunkingRequest) -> OCRChunkingResponse:
             return OCRChunkingResponse(
                 status="COMPLETED",
                 exitoso=True,
-                message="Pipeline completado exitosamente.",
+                message=f"Proceso '{stage_key}' completado exitosamente.",
                 phases=recorder.as_list(),
                 data=result_data,
             )
@@ -1790,10 +1721,10 @@ def run_real_pipeline(request: OCRChunkingRequest) -> OCRChunkingResponse:
         return OCRChunkingResponse(
             status="FAILED",
             exitoso=False,
-            message="Pipeline fallido.",
+            message="Proceso fallido.",
             error=error_payload,
             phases=recorder.as_list(),
-            data={"oid": int(request.oid), "job_id": job_id, "file_name": file_name},
+            data={"oid": int(request.oid), "stage": stage_key, "job_id": job_id, "file_name": file_name},
         )
 
     except Exception as exc:
@@ -1827,10 +1758,10 @@ def run_real_pipeline(request: OCRChunkingRequest) -> OCRChunkingResponse:
         return OCRChunkingResponse(
             status="FAILED",
             exitoso=False,
-            message="Pipeline fallido por error inesperado.",
+            message="Proceso fallido por error inesperado.",
             error=unknown.to_dict(),
             phases=recorder.as_list(),
-            data={"oid": int(request.oid), "job_id": job_id, "file_name": file_name},
+            data={"oid": int(request.oid), "stage": stage_key, "job_id": job_id, "file_name": file_name},
         )
 
     finally:
@@ -1849,24 +1780,23 @@ def run_real_pipeline(request: OCRChunkingRequest) -> OCRChunkingResponse:
                 LOGGER.exception("No fue posible refrescar queue stats.")
 
 
-def process_request(request: OCRChunkingRequest) -> OCRChunkingResponse:
-    """Selects mock or real pipeline execution."""
+def process_request(request: OCRChunkingRequest, stage: str = "pipeline") -> OCRChunkingResponse:
+    """Selects mock or real pipeline execution by stage."""
     if request.mock.enabled:
         return run_mock_pipeline(request)
-    return run_real_pipeline(request)
+    return run_real_pipeline(request, stage=stage)
 
-
-def process_batch(request: OCRChunkingBatchRequest) -> OCRChunkingBatchResponse:
+def process_batch(request: OCRChunkingBatchRequest, stage: str = "pipeline") -> OCRChunkingBatchResponse:
     """Processes a batch of requests sequentially or in parallel."""
     total = len(request.requests)
     results: List[Optional[OCRChunkingResponse]] = [None] * total
 
     if request.parallel_workers <= 1:
         for idx, item in enumerate(request.requests):
-            results[idx] = process_request(item)
+            results[idx] = process_request(item, stage=stage)
     else:
         with ThreadPoolExecutor(max_workers=request.parallel_workers) as pool:
-            future_map = {pool.submit(process_request, item): idx for idx, item in enumerate(request.requests)}
+            future_map = {pool.submit(process_request, item, stage): idx for idx, item in enumerate(request.requests)}
             for future in as_completed(future_map):
                 idx = future_map[future]
                 try:
@@ -1906,13 +1836,15 @@ def sample_request() -> Dict[str, Any]:
         oid=2299268,
         file_name=None,
         documento_id=7788,
-        job_file_id=4567,
-        item_id=2,
+        job_filde_id=4567,
         created_by=1101,
-        metadata={"fuente": "ANH", "proceso": "ocr_chunking"},
-        execution_mode="sync",
-        queue=QueueOptions(enabled=True, name=DEFAULT_QUEUE_NAME, job_type=DEFAULT_JOB_TYPE, queue_when_busy=True),
-        overwrite=OverwriteOptions(enabled=False, scope="documento_modelo"),
+        metadata={
+            "nombre_documento": "CTO_EyP_LLA_50_2013.pdf",
+            "metadata_documento": {"paginas": 133, "idioma": "es"},
+            "ruta_pdf": "\\\\servidor\\share\\CTO_EyP_LLA_50_2013.pdf",
+        },
+        queue=QueueOptions(enabled=True, max_concurrency=2, queue_when_busy=True),
+        overwrite=OverwriteOptions(enabled=False),
         extraction=ExtractionOptions(
             engine="auto",
             enable_pymupdf_fast_path=True,
@@ -1922,7 +1854,7 @@ def sample_request() -> Dict[str, Any]:
             tail_pages=8,
         ),
         cleaning=CleaningOptions(enabled=True, remove_headers=True, remove_isolated_numbers=True),
-        chunking=ChunkingOptions(strategy="semantic", target_chunks=None, max_chunks=0),
+        chunking=ChunkingOptions(strategy="semantic", max_chunks=0, enable_simple_fallback=False),
         embedding=EmbeddingOptions(enabled=True, model_name=DEFAULT_EMBEDDING_MODEL, save_to_db=True, return_vectors=False),
         mock=MockOptions(enabled=False),
     )
@@ -1933,9 +1865,9 @@ app = FastAPI(
     title=SERVICE_NAME,
     version=SERVICE_VERSION,
     description=(
-        "Servicio OpenAPI para orquestar OCR (Docling/PyMuPDF), limpieza, chunking y embeddings.\n"
-        "Entrada obligatoria: oid.\n"
-        "Incluye estado por fases, colas, sobreescritura y modo mock."
+        "Servicio OpenAPI para OCR, chunking y embeddings.\n"
+        "Rutas funcionales: /ocr-docling, /chunking-docling, /embedding-generation, /PipelineOCR.\n"
+        "Entrada obligatoria: oid."
     ),
 )
 
@@ -1958,45 +1890,98 @@ def example_request() -> Dict[str, Any]:
     return {"input": sample_request()}
 
 
-@app.post("/ocr-chunking/process", response_model=OCRChunkingResponse, tags=SERVICE_TAGS)
-def process_endpoint(payload: Dict[str, Any]) -> OCRChunkingResponse:
-    """Single-document endpoint."""
+@app.post("/ocr-docling/process", response_model=OCRChunkingResponse, tags=SERVICE_TAGS)
+def ocr_docling_process(payload: Dict[str, Any]) -> OCRChunkingResponse:
+    """Ejecuta solo OCR + limpieza de texto."""
     input_payload = payload.get("input", payload)
     try:
         request = OCRChunkingRequest(**input_payload)
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Payload invalido: {str(exc)}") from exc
-    return process_request(request)
+    return process_request(request, stage="ocr")
 
 
-@app.post("/ocr-chunking/process-batch", response_model=OCRChunkingBatchResponse, tags=SERVICE_TAGS)
-def process_batch_endpoint(payload: Dict[str, Any]) -> OCRChunkingBatchResponse:
-    """Batch endpoint with optional parallel workers."""
+@app.post("/ocr-docling/process-batch", response_model=OCRChunkingBatchResponse, tags=SERVICE_TAGS)
+def ocr_docling_batch(payload: Dict[str, Any]) -> OCRChunkingBatchResponse:
+    """Ejecuta OCR + limpieza para varios documentos."""
     input_payload = payload.get("input", payload)
     try:
         request = OCRChunkingBatchRequest(**input_payload)
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Payload batch invalido: {str(exc)}") from exc
-    return process_batch(request)
+    return process_batch(request, stage="ocr")
 
 
-@app.get("/ocr-chunking/jobs/{job_id}", tags=SERVICE_TAGS)
-def get_job_endpoint(job_id: int) -> Dict[str, Any]:
-    """Gets one Operaciones.JobsProcesamiento row."""
-    with PostgresClient(PostgresSettings.from_env()) as db:
-        row = db.get_job(job_id)
-        if row is None:
-            raise HTTPException(status_code=404, detail=f"Job {job_id} no encontrado.")
-        row["parametros"] = to_json_dict(row.get("parametros"), {})
-        row["resultado"] = to_json_dict(row.get("resultado"), {})
-        return {"status": "ok", "job": row}
+@app.post("/chunking-docling/process", response_model=OCRChunkingResponse, tags=SERVICE_TAGS)
+def chunking_docling_process(payload: Dict[str, Any]) -> OCRChunkingResponse:
+    """Ejecuta OCR + limpieza + chunking."""
+    input_payload = payload.get("input", payload)
+    try:
+        request = OCRChunkingRequest(**input_payload)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Payload invalido: {str(exc)}") from exc
+    return process_request(request, stage="chunking")
+
+
+@app.post("/chunking-docling/process-batch", response_model=OCRChunkingBatchResponse, tags=SERVICE_TAGS)
+def chunking_docling_batch(payload: Dict[str, Any]) -> OCRChunkingBatchResponse:
+    """Ejecuta OCR + limpieza + chunking para varios documentos."""
+    input_payload = payload.get("input", payload)
+    try:
+        request = OCRChunkingBatchRequest(**input_payload)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Payload batch invalido: {str(exc)}") from exc
+    return process_batch(request, stage="chunking")
+
+
+@app.post("/embedding-generation/process", response_model=OCRChunkingResponse, tags=SERVICE_TAGS)
+def embedding_generation_process(payload: Dict[str, Any]) -> OCRChunkingResponse:
+    """Ejecuta OCR + limpieza + chunking + generacion de embeddings."""
+    input_payload = payload.get("input", payload)
+    try:
+        request = OCRChunkingRequest(**input_payload)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Payload invalido: {str(exc)}") from exc
+    return process_request(request, stage="embedding")
+
+
+@app.post("/embedding-generation/process-batch", response_model=OCRChunkingBatchResponse, tags=SERVICE_TAGS)
+def embedding_generation_batch(payload: Dict[str, Any]) -> OCRChunkingBatchResponse:
+    """Ejecuta generacion de embeddings para varios documentos."""
+    input_payload = payload.get("input", payload)
+    try:
+        request = OCRChunkingBatchRequest(**input_payload)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Payload batch invalido: {str(exc)}") from exc
+    return process_batch(request, stage="embedding")
+
+
+@app.post("/PipelineOCR/process", response_model=OCRChunkingResponse, tags=SERVICE_TAGS)
+def pipeline_ocr_process(payload: Dict[str, Any]) -> OCRChunkingResponse:
+    """Orquesta todo el flujo: OCR, limpieza, chunking, embeddings e insercion."""
+    input_payload = payload.get("input", payload)
+    try:
+        request = OCRChunkingRequest(**input_payload)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Payload invalido: {str(exc)}") from exc
+    return process_request(request, stage="pipeline")
+
+
+@app.post("/PipelineOCR/process-batch", response_model=OCRChunkingBatchResponse, tags=SERVICE_TAGS)
+def pipeline_ocr_batch(payload: Dict[str, Any]) -> OCRChunkingBatchResponse:
+    """Orquesta flujo completo para varios documentos."""
+    input_payload = payload.get("input", payload)
+    try:
+        request = OCRChunkingBatchRequest(**input_payload)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Payload batch invalido: {str(exc)}") from exc
+    return process_batch(request, stage="pipeline")
 
 
 def run_mock_local_demo(args: argparse.Namespace) -> None:
     """Runs local mock example from CLI and prints JSON response."""
     request = OCRChunkingRequest(
         oid=int(args.mock_oid),
-        execution_mode="sync",
         mock=MockOptions(
             enabled=True,
             fail_phase=args.mock_fail_phase,
@@ -2032,3 +2017,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

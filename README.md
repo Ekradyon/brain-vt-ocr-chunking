@@ -1,101 +1,199 @@
-# Brain VT – OCR Chunking Embeddings
+﻿# OCR Chunking Embedding - Guia rapida
 
-> Servicio de orquestación **OCR + chunking + embeddings** para el proyecto **Brain VT** (cliente ANH).  
-> EKRADYON · GitHub Enterprise.
+Servicio OpenAPI para procesar PDFs almacenados como Large Object en PostgreSQL.
 
----
+## Que hace el servicio
 
-## Descripción
+`ocr_chunking.py` implementa un orquestador con 4 rutas funcionales:
 
-Servicio **FastAPI/OpenAPI** que orquesta:
+1. `ocr-docling`: OCR + limpieza.
+2. `chunking-docling`: OCR + limpieza + chunking.
+3. `embedding-generation`: OCR + limpieza + chunking + embeddings.
+4. `PipelineOCR`: flujo completo (incluye persistencia en `IaCore.Embeddings`).
 
-- **OCR**: Docling o PyMuPDF (detección automática por confianza de texto).
-- **Limpieza**: cabeceras repetidas, números aislados, opcional corrección de tokens invertidos.
-- **Chunking**: semántico (Docling HybridChunker) o simple por tamaño/solapamiento.
-- **Embeddings**: modelo `intfloat/multilingual-e5-large-instruct`, persistencia en `IaCore.Embeddings`.
-- **Colas**: integración con `Operaciones.ColasProcesamiento` y `Operaciones.JobsProcesamiento` (tipo `BRAINVT_OCR_EMBEDDINGS_GPU`).
+El servicio usa cola (`Operaciones.ColasProcesamiento`) para controlar concurrencia y genera trazabilidad por fases en `Operaciones.JobsProcesamiento`.
 
-**Entrada principal:** OID de PostgreSQL Large Object (`pg_largeobject`). Los ítems se resuelven desde `Operaciones.ItemsIngestaSmb` por `loOid`.
+## Flujo general
 
----
-
-## Ramas
-
-- **main**: código estable; no hacer commit directo. Solo recibe merges desde `develop` o hotfixes.
-- **develop**: rama de trabajo; integración y PR hacia `main` cuando corresponda.
-
----
-
-## Requisitos
-
-- Python 3.10+
-- PostgreSQL con esquemas `Operaciones`, `IaCore`, `BrainVtCommons`.
-- Opcional: GPU (CUDA) para embeddings.
-
----
-
-## Instalación
-
-```bash
-pip install -r requirements.txt
+```mermaid
+flowchart TD
+    A[POST endpoint] --> B[Validar input]
+    B --> C[Resolver OID en ItemsIngestaSmb]
+    C --> D[Leer PDF desde pg_largeobject]
+    D --> E[Seleccion de paginas full o head_tail]
+    E --> F[Probe PyMuPDF: confianza texto]
+    F --> G[Extraccion texto: PyMuPDF o Docling]
+    G --> H[Limpieza texto]
+    H --> I{Endpoint requiere chunking?}
+    I -- No --> Z1[Respuesta OCR]
+    I -- Si --> J[Chunking semantic/simple]
+    J --> K{Endpoint requiere embeddings?}
+    K -- No --> Z2[Respuesta Chunking]
+    K -- Si --> L[Generar embeddings]
+    L --> M{save_to_db = true?}
+    M -- No --> Z3[Respuesta Embeddings]
+    M -- Si --> N[Overwrite a nivel documento]
+    N --> O[Insertar IaCore.Embeddings]
+    O --> Z4[Respuesta Pipeline]
 ```
 
----
+## Endpoints
 
-## Uso
+### 1) OCR Docling
 
-**Servidor API (puerto 8000):**
+- `POST /ocr-docling/process`
+- `POST /ocr-docling/process-batch`
 
-```bash
-python ocr_chunking.py --host 0.0.0.0 --port 8000
+Minimo:
+
+```json
+{
+  "input": {
+    "oid": 2299268
+  }
+}
 ```
 
-**Demo local sin base de datos (modo mock):**
+Retorno esperado (resumen):
 
-```bash
-python ocr_chunking.py --mock-local
+```json
+{
+  "status": "COMPLETED",
+  "exitoso": true,
+  "data": {
+    "stage": "ocr",
+    "engine_used": "pymupdf",
+    "ocr_text_chars": 12345
+  }
+}
 ```
 
-**Variables de entorno (ejemplo):**
+### 2) Chunking Docling
 
-| Variable | Descripción | Default |
-|----------|-------------|---------|
-| `OCR_DB_HOST` | Host PostgreSQL | `localhost` |
-| `OCR_DB_PORT` | Puerto | `5432` |
-| `OCR_DB_NAME` | Base de datos | `niledb` |
-| `OCR_DB_USER` | Usuario | `postgres` |
-| `OCR_DB_PASSWORD` | Contraseña | — |
-| `OCR_LOG_LEVEL` | Nivel de log | `INFO` |
+- `POST /chunking-docling/process`
+- `POST /chunking-docling/process-batch`
 
----
+Minimo:
 
-## Endpoints OpenAPI
-
-- `GET /health` — Estado del servicio y GPU.
-- `GET /example-request` — Ejemplo de payload de solicitud.
-- `POST /ocr-chunking/process` — Procesar un documento (entrada: `oid` y opciones).
-- `POST /ocr-chunking/process-batch` — Procesar varios documentos (paralelo opcional).
-- `GET /ocr-chunking/jobs/{job_id}` — Consultar estado de un job.
-
-Documentación interactiva: `http://<host>:8000/docs` (Swagger UI).
-
----
-
-## Estructura del repo
-
-```
-brain-vt-ocr-chunking/
-├── ocr_chunking.py    # Servicio único (FastAPI + pipeline)
-├── requirements.txt
-├── README.md
-└── .gitignore
+```json
+{
+  "input": {
+    "oid": 2299268,
+    "chunking": { "strategy": "semantic" }
+  }
+}
 ```
 
----
+Retorno esperado (resumen):
 
-## Proyecto y cliente
+```json
+{
+  "status": "COMPLETED",
+  "exitoso": true,
+  "data": {
+    "stage": "chunking",
+    "chunks_count": 32,
+    "chunks_preview": ["..."]
+  }
+}
+```
 
-- **Proyecto:** Brain VT  
-- **Cliente:** ANH  
-- **Organización:** EKRADYON  
-- **Uso:** interno; no distribuir sin autorización.
+### 3) Embedding Generation
+
+- `POST /embedding-generation/process`
+- `POST /embedding-generation/process-batch`
+
+Minimo:
+
+```json
+{
+  "input": {
+    "oid": 2299268,
+    "embedding": { "enabled": true, "save_to_db": false }
+  }
+}
+```
+
+Retorno esperado (resumen):
+
+```json
+{
+  "status": "COMPLETED",
+  "exitoso": true,
+  "data": {
+    "stage": "embedding",
+    "chunks_count": 32,
+    "inserted_rows": 0
+  }
+}
+```
+
+### 4) PipelineOCR (todo el proceso)
+
+- `POST /PipelineOCR/process`
+- `POST /PipelineOCR/process-batch`
+
+Minimo para persistir:
+
+```json
+{
+  "input": {
+    "oid": 2299268,
+    "documento_id": 7788
+  }
+}
+```
+
+Retorno esperado (resumen):
+
+```json
+{
+  "status": "COMPLETED",
+  "exitoso": true,
+  "data": {
+    "stage": "pipeline",
+    "documento_id": 7788,
+    "chunks_count": 32,
+    "inserted_rows": 32
+  }
+}
+```
+
+## Endpoints auxiliares
+
+- `GET /health`
+- `GET /example-request`
+
+## Parametros minimos / medios / completos
+
+- Minimo tecnico: `oid`.
+- Minimo para guardar embeddings: `oid + documento_id`.
+- Medio recomendado: `oid + documento_id + metadata + queue.max_concurrency`.
+- Completo: ajustar `extraction`, `cleaning`, `chunking`, `embedding`, `overwrite`, `queue`.
+
+## Errores comunes
+
+- `OID_NOT_FOUND`: el `oid` no existe en `ItemsIngestaSmb`.
+- `QUEUE_BUSY`: cola llena y `queue_when_busy=false`.
+- `DOCUMENTO_ID_REQUIRED`: se quiere guardar en BD sin `documento_id`.
+- `DUPLICATE_EMBEDDINGS`: existen embeddings y `overwrite.enabled=false`.
+- `EMPTY_EXTRACTED_TEXT`: OCR/extraccion sin contenido.
+
+## Ejecucion local
+
+```powershell
+python testProcesamientoOCR-Embedding\ocr_chunking.py --host 0.0.0.0 --port 8080
+```
+
+Documentacion interactiva:
+
+- `http://127.0.0.1:8080/docs`
+- `http://127.0.0.1:8080/redoc`
+
+## Pruebas mock
+
+```powershell
+python testProcesamientoOCR-Embedding\test_mock_ocr_chunking.py
+```
+
+Ver detalle funcional de parametros en `funcionalidades_parametro.md`.
