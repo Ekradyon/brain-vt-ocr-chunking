@@ -1,16 +1,27 @@
 # Brain VT – OCR Chunking Embeddings service
 # Python 3.10+
+# Mapeo: fitz -> pymupdf; docling_core -> docling-core
 
+# API
 fastapi>=0.100.0
 uvicorn[standard]>=0.22.0
 pydantic>=2.0.0
+python-multipart>=0.0.6
 
+# Base de datos
 psycopg2-binary>=2.9.0
 
+# ML / embeddings (torch, transformers)
 torch>=2.0.0
 transformers>=4.30.0
+accelerate>=0.20.0
+sentencepiece>=0.1.99
+huggingface-hub>=0.19.0
 
+# OCR y documento (docling, fitz = pymupdf)
 docling>=2.0.0
 docling-core>=0.1.0
-
 pymupdf>=1.23.0
+
+# Numérico (usado por torch/docling/transformers)
+numpy>=1.24.0
