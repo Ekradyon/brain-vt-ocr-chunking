@@ -1,4 +1,4 @@
-﻿# OCR Chunking Embedding - Guia rapida
+# OCR Chunking Embedding - Guia rapida
 
 Servicio OpenAPI para procesar PDFs almacenados como Large Object en PostgreSQL.
 
@@ -163,6 +163,7 @@ Retorno esperado (resumen):
 
 - `GET /health`
 - `GET /example-request`
+- `GET /validate-db` — Valida la conexión a Postgres (versión, metadatos y consulta de prueba). Misma lógica que `validate_db.py`.
 
 ## Parametros minimos / medios / completos
 
