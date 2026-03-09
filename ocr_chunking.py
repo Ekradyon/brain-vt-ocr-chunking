@@ -29,7 +29,7 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -51,7 +51,19 @@ from transformers import AutoModel, AutoTokenizer
 
 SERVICE_NAME = "OCR Chunking Embeddings Orchestrator"
 SERVICE_VERSION = "2.0.0"
-SERVICE_TAGS = ["ocr", "chunking", "embeddings", "docling", "postgres", "openapi"]
+TAG_CHUNKING = "Segmento Chunking"
+TAG_EMBEDDING = "Segmento Embedding"
+TAG_OCR = "Segmento Docling-OCR"
+TAG_PIPELINE = "Segmento Pipeline"
+TAG_HELPERS = "Segmento Helpers"
+
+OPENAPI_TAGS = [
+    {"name": TAG_CHUNKING, "description": "Metodos de chunking (texto a chunks)."},
+    {"name": TAG_EMBEDDING, "description": "Metodos de generacion de embeddings."},
+    {"name": TAG_OCR, "description": "Metodos de OCR y extraccion de texto."},
+    {"name": TAG_PIPELINE, "description": "Metodos de orquestacion completa PipelineOCR."},
+    {"name": TAG_HELPERS, "description": "Endpoints auxiliares: health, example-request, validate-db."},
+]
 
 DEFAULT_QUEUE_NAME = "BRAINVT_OCR_EMBEDDINGS_GPU"
 DEFAULT_JOB_TYPE = "BRAINVT_OCR_EMBEDDINGS_GPU"
@@ -264,6 +276,89 @@ class PostgresSettings:
             user=os.getenv("OCR_DB_USER", "postgres"),
             password=os.getenv("OCR_DB_PASSWORD", "plexia"),
         )
+
+
+def bogota_now_iso() -> str:
+    """Returns current time in America/Bogota offset as ISO string."""
+    bogota_tz = timezone(timedelta(hours=-5))
+    return datetime.now(bogota_tz).replace(microsecond=0).isoformat()
+
+
+def _validate_db_connection() -> Dict[str, Any]:
+    """
+    Valida conexión a Postgres.
+    Retorna versión, metadatos y resultado de una consulta de prueba.
+    """
+    settings = PostgresSettings.from_env()
+    try:
+        conn = psycopg2.connect(
+            host=settings.host,
+            port=settings.port,
+            dbname=settings.dbname,
+            user=settings.user,
+            password=settings.password,
+            connect_timeout=5,
+        )
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT current_database() AS current_database, current_user AS current_user, version() AS version;"
+                )
+                row = cur.fetchone()
+                if not row:
+                    return {
+                        "status": "error",
+                        "message": "No se obtuvo fila de metadatos.",
+                        "postgres_version": None,
+                        "metadata": None,
+                        "test_query": None,
+                        "error": "Empty result",
+                    }
+                version_str = row["version"] or ""
+                version_short = version_str.split(",")[0].strip() if version_str else None
+                metadata = {
+                    "current_database": row["current_database"],
+                    "current_user": row["current_user"],
+                    "server_version_full": version_str,
+                    "server_version_short": version_short,
+                    "connection": {
+                        "host": settings.host,
+                        "port": settings.port,
+                        "dbname": settings.dbname,
+                        "user": settings.user,
+                    },
+                }
+                cur.execute(
+                    "SELECT 1 AS ping, current_timestamp AS server_time, "
+                    "current_setting('server_version_num') AS version_num;"
+                )
+                test_row = cur.fetchone()
+                test_query = dict(test_row) if test_row else None
+            return {
+                "status": "ok",
+                "message": "Conexión exitosa.",
+                "postgres_version": version_short,
+                "metadata": metadata,
+                "test_query": test_query,
+                "error": None,
+            }
+        finally:
+            conn.close()
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": "No se pudo conectar a Postgres.",
+            "postgres_version": None,
+            "metadata": {
+                "connection": {
+                    "host": settings.host,
+                    "port": settings.port,
+                    "dbname": settings.dbname,
+                }
+            },
+            "test_query": None,
+            "error": str(exc),
+        }
 
 
 class PostgresClient:
@@ -1923,6 +2018,7 @@ def sample_request() -> Dict[str, Any]:
 app = FastAPI(
     title=SERVICE_NAME,
     version=SERVICE_VERSION,
+    openapi_tags=OPENAPI_TAGS,
     description=(
         "Servicio OpenAPI para OCR, chunking y embeddings.\n"
         "Rutas funcionales: /ocr-docling, /chunking-docling, /embedding-generation, /PipelineOCR.\n"
@@ -1931,7 +2027,7 @@ app = FastAPI(
 )
 
 
-@app.get("/health", tags=SERVICE_TAGS)
+@app.get("/health", tags=[TAG_HELPERS])
 def health() -> Dict[str, Any]:
     """Health endpoint."""
     return {
@@ -1943,13 +2039,25 @@ def health() -> Dict[str, Any]:
     }
 
 
-@app.get("/example-request", tags=SERVICE_TAGS)
+@app.get("/example-request", tags=[TAG_HELPERS])
 def example_request() -> Dict[str, Any]:
     """Returns request payload example."""
     return {"input": sample_request()}
 
 
-@app.post("/ocr-docling/process", response_model=OCRChunkingResponse, tags=SERVICE_TAGS)
+@app.get("/validate-db", tags=[TAG_HELPERS])
+def validate_db() -> Dict[str, Any]:
+    """
+    Valida conexión a Postgres a nivel API.
+    Retorna versión, metadatos y una consulta de prueba.
+    """
+    result = _validate_db_connection()
+    result["timestamp"] = bogota_now_iso()
+    result["service"] = SERVICE_NAME
+    return to_json_safe(result)
+
+
+@app.post("/ocr-docling/process", response_model=OCRChunkingResponse, tags=[TAG_OCR])
 def ocr_docling_process(payload: Dict[str, Any]) -> OCRChunkingResponse:
     """Ejecuta solo OCR + limpieza de texto."""
     input_payload = payload.get("input", payload)
@@ -1960,7 +2068,7 @@ def ocr_docling_process(payload: Dict[str, Any]) -> OCRChunkingResponse:
     return process_request(request, stage="ocr")
 
 
-@app.post("/ocr-docling/process-batch", response_model=OCRChunkingBatchResponse, tags=SERVICE_TAGS)
+@app.post("/ocr-docling/process-batch", response_model=OCRChunkingBatchResponse, tags=[TAG_OCR])
 def ocr_docling_batch(payload: Dict[str, Any]) -> OCRChunkingBatchResponse:
     """Ejecuta OCR + limpieza para varios documentos."""
     input_payload = payload.get("input", payload)
@@ -1971,7 +2079,7 @@ def ocr_docling_batch(payload: Dict[str, Any]) -> OCRChunkingBatchResponse:
     return process_batch(request, stage="ocr")
 
 
-@app.post("/chunking-docling/process", response_model=OCRChunkingResponse, tags=SERVICE_TAGS)
+@app.post("/chunking-docling/process", response_model=OCRChunkingResponse, tags=[TAG_CHUNKING])
 def chunking_docling_process(payload: Dict[str, Any]) -> OCRChunkingResponse:
     """Ejecuta OCR + limpieza + chunking."""
     input_payload = payload.get("input", payload)
@@ -1982,7 +2090,7 @@ def chunking_docling_process(payload: Dict[str, Any]) -> OCRChunkingResponse:
     return process_request(request, stage="chunking")
 
 
-@app.post("/chunking-docling/process-batch", response_model=OCRChunkingBatchResponse, tags=SERVICE_TAGS)
+@app.post("/chunking-docling/process-batch", response_model=OCRChunkingBatchResponse, tags=[TAG_CHUNKING])
 def chunking_docling_batch(payload: Dict[str, Any]) -> OCRChunkingBatchResponse:
     """Ejecuta OCR + limpieza + chunking para varios documentos."""
     input_payload = payload.get("input", payload)
@@ -1993,7 +2101,7 @@ def chunking_docling_batch(payload: Dict[str, Any]) -> OCRChunkingBatchResponse:
     return process_batch(request, stage="chunking")
 
 
-@app.post("/embedding-generation/process", response_model=OCRChunkingResponse, tags=SERVICE_TAGS)
+@app.post("/embedding-generation/process", response_model=OCRChunkingResponse, tags=[TAG_EMBEDDING])
 def embedding_generation_process(payload: Dict[str, Any]) -> OCRChunkingResponse:
     """Ejecuta OCR + limpieza + chunking + generacion de embeddings."""
     input_payload = payload.get("input", payload)
@@ -2004,7 +2112,7 @@ def embedding_generation_process(payload: Dict[str, Any]) -> OCRChunkingResponse
     return process_request(request, stage="embedding")
 
 
-@app.post("/embedding-generation/process-batch", response_model=OCRChunkingBatchResponse, tags=SERVICE_TAGS)
+@app.post("/embedding-generation/process-batch", response_model=OCRChunkingBatchResponse, tags=[TAG_EMBEDDING])
 def embedding_generation_batch(payload: Dict[str, Any]) -> OCRChunkingBatchResponse:
     """Ejecuta generacion de embeddings para varios documentos."""
     input_payload = payload.get("input", payload)
@@ -2015,7 +2123,7 @@ def embedding_generation_batch(payload: Dict[str, Any]) -> OCRChunkingBatchRespo
     return process_batch(request, stage="embedding")
 
 
-@app.post("/PipelineOCR/process", response_model=OCRChunkingResponse, tags=SERVICE_TAGS)
+@app.post("/PipelineOCR/process", response_model=OCRChunkingResponse, tags=[TAG_PIPELINE])
 def pipeline_ocr_process(payload: Dict[str, Any]) -> OCRChunkingResponse:
     """Orquesta todo el flujo: OCR, limpieza, chunking, embeddings e insercion."""
     input_payload = payload.get("input", payload)
@@ -2026,7 +2134,7 @@ def pipeline_ocr_process(payload: Dict[str, Any]) -> OCRChunkingResponse:
     return process_request(request, stage="pipeline")
 
 
-@app.post("/PipelineOCR/process-batch", response_model=OCRChunkingBatchResponse, tags=SERVICE_TAGS)
+@app.post("/PipelineOCR/process-batch", response_model=OCRChunkingBatchResponse, tags=[TAG_PIPELINE])
 def pipeline_ocr_batch(payload: Dict[str, Any]) -> OCRChunkingBatchResponse:
     """Orquesta flujo completo para varios documentos."""
     input_payload = payload.get("input", payload)
