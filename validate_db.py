@@ -8,11 +8,11 @@ except ImportError:
     print("ERROR: psycopg2 no instalado. Ejecuta: pip install psycopg2-binary")
     sys.exit(1)
 
-host = os.getenv("OCR_DB_HOST", "localhost")
-port = int(os.getenv("OCR_DB_PORT", "5432"))
-dbname = os.getenv("OCR_DB_NAME", "niledb")
-user = os.getenv("OCR_DB_USER", "postgres")
-password = os.getenv("OCR_DB_PASSWORD", "")
+host = os.getenv("OCR_DB_HOST", "<DB_HOST>")
+port = int(os.getenv("OCR_DB_PORT", "<DB_PORT>"))
+dbname = os.getenv("OCR_DB_NAME", "<DB_NAME>")
+user = os.getenv("OCR_DB_USER", "<DB_USER>")
+password = os.getenv("OCR_DB_PASSWORD", "<DB_PASSWORD>")
 
 print(f"Conectando a {host}:{port} db={dbname} user={user} ...")
 try:

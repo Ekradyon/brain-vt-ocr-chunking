@@ -1,4 +1,4 @@
-﻿"""
+"""
 OCR + chunking + embeddings orchestrator (FastAPI/OpenAPI, psycopg2, no plpy).
 
 Main goals:
@@ -31,6 +31,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from threading import Lock
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Tuple
 
 import fitz
@@ -85,6 +86,11 @@ _DOCLING_LOCK = Lock()
 def utc_now_iso() -> str:
     """Returns UTC timestamp as ISO string."""
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def bogota_now_iso() -> str:
+    """Returns current timestamp in America/Bogota as ISO string."""
+    return datetime.now(ZoneInfo("America/Bogota")).replace(microsecond=0).isoformat()
 
 
 def safe_str(value: Any, default: str = "") -> str:
@@ -232,12 +238,17 @@ class PostgresSettings:
     @staticmethod
     def from_env() -> "PostgresSettings":
         """Loads DB settings from environment."""
+        port_raw = os.getenv("OCR_DB_PORT", "5432")
+        try:
+            port = int(port_raw)
+        except ValueError:
+            port = 5432
         return PostgresSettings(
-            host=os.getenv("OCR_DB_HOST", "localhost"),
-            port=int(os.getenv("OCR_DB_PORT", "5432")),
-            dbname=os.getenv("OCR_DB_NAME", "niledb"),
-            user=os.getenv("OCR_DB_USER", "postgres"),
-            password=os.getenv("OCR_DB_PASSWORD", "plexia"),
+            host=os.getenv("OCR_DB_HOST", "<DB_HOST>"),
+            port=port,
+            dbname=os.getenv("OCR_DB_NAME", "<DB_NAME>"),
+            user=os.getenv("OCR_DB_USER", "<DB_USER>"),
+            password=os.getenv("OCR_DB_PASSWORD", "<DB_PASSWORD>"),
         )
 
 
@@ -1872,6 +1883,77 @@ app = FastAPI(
 )
 
 
+def _validate_db_connection() -> Dict[str, Any]:
+    """
+    Valida conexión a Postgres (misma lógica que validate_db.py).
+    Retorna versión, metadatos y resultado de una consulta de prueba.
+    """
+    settings = PostgresSettings.from_env()
+    try:
+        conn = psycopg2.connect(
+            host=settings.host,
+            port=settings.port,
+            dbname=settings.dbname,
+            user=settings.user,
+            password=settings.password,
+            connect_timeout=5,
+        )
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT current_database() AS current_database, current_user AS current_user, version() AS version;"
+                )
+                row = cur.fetchone()
+                if not row:
+                    return {
+                        "status": "error",
+                        "message": "No se obtuvo fila de metadatos.",
+                        "postgres_version": None,
+                        "metadata": None,
+                        "test_query": None,
+                        "error": "Empty result",
+                    }
+                version_str = row["version"] or ""
+                version_short = version_str.split(",")[0].strip() if version_str else None
+                metadata = {
+                    "current_database": row["current_database"],
+                    "current_user": row["current_user"],
+                    "server_version_full": version_str,
+                    "server_version_short": version_short,
+                    "connection": {
+                        "host": settings.host,
+                        "port": settings.port,
+                        "dbname": settings.dbname,
+                        "user": settings.user,
+                    },
+                }
+                cur.execute(
+                    "SELECT 1 AS ping, current_timestamp AS server_time, "
+                    "current_setting('server_version_num') AS version_num;"
+                )
+                test_row = cur.fetchone()
+                test_query = dict(test_row) if test_row else None
+            return {
+                "status": "ok",
+                "message": "Conexión exitosa.",
+                "postgres_version": version_short,
+                "metadata": metadata,
+                "test_query": test_query,
+                "error": None,
+            }
+        finally:
+            conn.close()
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": "No se pudo conectar a Postgres.",
+            "postgres_version": None,
+            "metadata": {"connection": {"host": settings.host, "port": settings.port, "dbname": settings.dbname}},
+            "test_query": None,
+            "error": str(exc),
+        }
+
+
 @app.get("/health", tags=SERVICE_TAGS)
 def health() -> Dict[str, Any]:
     """Health endpoint."""
@@ -1888,6 +1970,18 @@ def health() -> Dict[str, Any]:
 def example_request() -> Dict[str, Any]:
     """Returns request payload example."""
     return {"input": sample_request()}
+
+
+@app.get("/validate-db", tags=SERVICE_TAGS)
+def validate_db() -> Dict[str, Any]:
+    """
+    Valida la conexión a Postgres a nivel API (misma lógica que validate_db.py).
+    Retorna versión de PostgreSQL, metadatos de conexión y resultado de una consulta de prueba.
+    """
+    result = _validate_db_connection()
+    result["timestamp"] = bogota_now_iso()
+    result["service"] = SERVICE_NAME
+    return result
 
 
 @app.post("/ocr-docling/process", response_model=OCRChunkingResponse, tags=SERVICE_TAGS)
