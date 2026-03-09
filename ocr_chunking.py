@@ -29,7 +29,7 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -145,6 +145,31 @@ def to_json_dict(value: Any, default: Optional[Dict[str, Any]] = None) -> Dict[s
         except Exception:
             return dict(default)
     return dict(default)
+
+
+def to_json_safe(value: Any) -> Any:
+    """Converts values to JSON-safe structures (datetime -> ISO, etc.)."""
+    if isinstance(value, dict):
+        return {safe_str(k): to_json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [to_json_safe(v) for v in value]
+    if isinstance(value, tuple):
+        return [to_json_safe(v) for v in value]
+    if isinstance(value, set):
+        return [to_json_safe(v) for v in sorted(value, key=lambda x: safe_str(x))]
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8", errors="replace")
+        except Exception:
+            return safe_str(value, "")
+    return value
+
+
+def json_dumps_safe(value: Any) -> str:
+    """JSON dump that never fails on datetime/date/bytes."""
+    return json.dumps(to_json_safe(value), ensure_ascii=False)
 
 
 def pydantic_model_dump(model: BaseModel) -> Dict[str, Any]:
@@ -466,7 +491,7 @@ class PostgresClient:
                 estado,
                 int(prioridad),
                 documento_id,
-                json.dumps(parametros, ensure_ascii=False),
+                json_dumps_safe(parametros),
                 int(max_intentos),
                 estado,
             ),
@@ -491,7 +516,7 @@ class PostgresClient:
 
         if resultado is not None:
             sets.append('"resultado" = %s')
-            params.append(json.dumps(resultado, ensure_ascii=False))
+            params.append(json_dumps_safe(resultado))
         if error_message is not None:
             sets.append('"errorMensaje" = %s')
             params.append(error_message)
@@ -654,7 +679,6 @@ class EmbeddingOptions(BaseModel):
     )
     save_to_db: bool = Field(default=True)
     return_vectors: bool = Field(default=False)
-    require_documento_id: bool = Field(default=True)
     require_inserted_rows: bool = Field(default=True)
     created_by_default: int = Field(default=DEFAULT_CREATED_BY)
 
@@ -671,12 +695,29 @@ class MockOptions(BaseModel):
 class OCRChunkingRequest(BaseModel):
     """Input request model."""
 
-    oid: int = Field(..., description="Required pg_largeobject OID.")
-    file_name: Optional[str] = Field(default=None, description="Optional file name; if missing, resolve by loOid.")
-    documento_id: Optional[int] = Field(default=None)
+    oid: int = Field(
+        ...,
+        description="Identificador unico del documento y OID del PDF (se usa el mismo valor para ambos).",
+    )
+    nombre_documento: Optional[str] = Field(
+        default=None,
+        description="Nombre del documento. Si se envia, no se intenta resolver nombre por OID.",
+    )
+    file_name: Optional[str] = Field(
+        default=None,
+        description="Alias opcional de nombre_documento para compatibilidad.",
+    )
     job_filde_id: Optional[int] = Field(
         default=None,
         description="Id de archivo/job para trazabilidad (compatibilidad con nombre solicitado).",
+    )
+    usuario_proceso: Optional[str] = Field(
+        default=None,
+        description="Usuario funcional que ejecuta la solicitud.",
+    )
+    job_proceso: Optional[str] = Field(
+        default=None,
+        description="Nombre o identificador funcional del job de negocio.",
     )
     created_by: Optional[int] = Field(default=None)
     metadata: Dict[str, Any] = Field(
@@ -698,9 +739,11 @@ class OCRChunkingRequest(BaseModel):
         "json_schema_extra": {
             "example": {
                 "oid": 2299268,
+                "nombre_documento": "CTO_EyP_LLA_50_2013.pdf",
                 "file_name": None,
-                "documento_id": 7788,
                 "job_filde_id": 4567,
+                "usuario_proceso": "analista_anh",
+                "job_proceso": "JOB_OCR_20260309_001",
                 "created_by": 1101,
                 "metadata": {
                     "nombre_documento": "CTO_EyP_LLA_50_2013.pdf",
@@ -1191,13 +1234,15 @@ def build_job_payload(
         "pipeline": "OCR_CHUNKING_SERVICE",
         "stage": stage,
         "oid": int(request.oid),
+        "oid_documento": int(request.oid),
         "file_name": file_name,
-        "documento_id": request.documento_id,
+        "usuario_proceso": request.usuario_proceso,
+        "job_proceso": request.job_proceso,
         "job_filde_id": request.job_filde_id,
         "queue_name": DEFAULT_QUEUE_NAME,
         "overwrite_enabled": request.overwrite.enabled,
         "metadata": request.metadata,
-        "resolved_item": item_info or {},
+        "resolved_item": to_json_safe(item_info or {}),
         "created_at_utc": utc_now_iso(),
     }
 
@@ -1302,7 +1347,8 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
     job_type = DEFAULT_JOB_TYPE if stage_key == "pipeline" else f"{DEFAULT_JOB_TYPE}_{stage_key.upper()}"
     job_id: Optional[int] = None
     item_info: Optional[Dict[str, Any]] = None
-    file_name = safe_str(request.file_name, "").strip()
+    file_name = safe_str(request.nombre_documento or request.file_name, "").strip()
+    documento_id = int(request.oid)
 
     recorder.push("REQUEST_VALIDATION", "OK", "Request recibida.", {"oid": int(request.oid), "stage": stage_key})
 
@@ -1324,28 +1370,35 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
 
     try:
         with PostgresClient(PostgresSettings.from_env()) as db:
-            item_info = db.fetch_item_by_oid(int(request.oid))
-            if item_info is None:
-                raise PipelineError(
+            if file_name:
+                recorder.push(
                     "LOAD_ITEM",
-                    "OID_NOT_FOUND",
-                    "No se encontro item por loOid.",
-                    {"oid": int(request.oid)},
+                    "SKIPPED",
+                    "Nombre de documento recibido en request; no se consulta nombre por OID.",
+                    {"file_name": file_name},
                 )
-            if not file_name:
-                file_name = safe_str(item_info.get("nombre_archivo"), "").strip()
-            if not file_name:
-                file_name = f"oid_{int(request.oid)}.pdf"
-            recorder.push(
-                "LOAD_ITEM",
-                "OK",
-                "Item resuelto por OID.",
-                {
-                    "item_id": safe_int(item_info.get("item_id"), None),
-                    "file_name": file_name,
-                    "estado_item": safe_str(item_info.get("estado"), ""),
-                },
-            )
+            else:
+                item_info = db.fetch_item_by_oid(int(request.oid))
+                if item_info is not None:
+                    file_name = safe_str(item_info.get("nombre_archivo"), "").strip()
+                    recorder.push(
+                        "LOAD_ITEM",
+                        "OK",
+                        "Item resuelto por OID.",
+                        {
+                            "item_id": safe_int(item_info.get("item_id"), None),
+                            "file_name": file_name,
+                            "estado_item": safe_str(item_info.get("estado"), ""),
+                        },
+                    )
+                if not file_name:
+                    file_name = f"documento_{int(request.oid)}.pdf"
+                    recorder.push(
+                        "LOAD_ITEM",
+                        "WARN",
+                        "No se encontro nombre por OID; se usa nombre por defecto.",
+                        {"file_name": file_name},
+                    )
 
             if request.queue.enabled:
                 queue_info = db.ensure_queue(
@@ -1371,7 +1424,7 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                             job_type=job_type,
                             estado="PENDIENTE",
                             prioridad=40,
-                            documento_id=request.documento_id,
+                            documento_id=documento_id,
                             parametros=payload,
                             max_intentos=3,
                         )
@@ -1413,13 +1466,21 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                 job_type=job_type,
                 estado="EN_PROCESO",
                 prioridad=40,
-                documento_id=request.documento_id,
+                documento_id=documento_id,
                 parametros=payload,
                 max_intentos=3,
             )
             update_job_progress(db, job_id, recorder, "RUNNING", "QUEUE_ADMISSION", {"job_id": job_id})
 
-            pdf_bytes = db.read_large_object(int(request.oid))
+            try:
+                pdf_bytes = db.read_large_object(int(request.oid))
+            except Exception as exc:
+                raise PipelineError(
+                    "LOAD_BINARY",
+                    "OID_READ_FAILED",
+                    "No fue posible leer el binary del OID solicitado.",
+                    {"oid": int(request.oid), "error": f"{type(exc).__name__}: {str(exc)}"},
+                ) from exc
             if not pdf_bytes:
                 raise PipelineError("LOAD_BINARY", "EMPTY_BINARY", "Large object vacio.")
             binary_sha256 = hashlib.sha256(pdf_bytes).hexdigest()
@@ -1561,14 +1622,6 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
 
             inserted_rows = 0
             if run_persist_stage:
-                documento_id = request.documento_id
-                if request.embedding.require_documento_id and documento_id is None:
-                    raise PipelineError(
-                        "OVERWRITE_CHECK",
-                        "DOCUMENTO_ID_REQUIRED",
-                        "documento_id es obligatorio para persistir embeddings.",
-                    )
-
                 existing_count = db.count_existing_embeddings(documento_id=documento_id)
                 deleted_count = 0
                 if existing_count > 0 and not request.overwrite.enabled:
@@ -1576,7 +1629,7 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                         "OVERWRITE_CHECK",
                         "DUPLICATE_EMBEDDINGS",
                         "Ya existen embeddings para el documento y overwrite.enabled=false.",
-                        {"documento_id": documento_id, "existing_count": existing_count},
+                        {"oid": documento_id, "existing_count": existing_count},
                     )
                 if existing_count > 0 and request.overwrite.enabled:
                     deleted_count = db.delete_existing_embeddings(documento_id=documento_id)
@@ -1601,6 +1654,8 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                     metadata_row = {
                         "oid": int(request.oid),
                         "file_name": file_name,
+                        "usuario_proceso": request.usuario_proceso,
+                        "job_proceso": request.job_proceso,
                         "phase": "PERSIST",
                         "item_id": safe_int(item_info.get("item_id"), None) if item_info else None,
                         "probe": probe,
@@ -1619,7 +1674,7 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                             int(created_by),
                             documento_id,
                             request.job_filde_id,
-                            json.dumps(metadata_row, ensure_ascii=False),
+                            json_dumps_safe(metadata_row),
                             request.embedding.model_name,
                             int(tokens_per_chunk[idx]) if idx < len(tokens_per_chunk) else 0,
                             vector_literal,
@@ -1649,9 +1704,11 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                 "stage": stage_key,
                 "job_id": job_id,
                 "file_name": file_name,
-                "item_id": safe_int(item_info.get("item_id"), None),
-                "documento_id": request.documento_id,
+                "item_id": safe_int(item_info.get("item_id"), None) if item_info else None,
+                "oid_documento": documento_id,
                 "job_filde_id": request.job_filde_id,
+                "usuario_proceso": request.usuario_proceso,
+                "job_proceso": request.job_proceso,
                 "queue_name": queue_name if request.queue.enabled else None,
                 "binary_sha256": binary_sha256,
                 "engine_used": engine,
@@ -1834,9 +1891,11 @@ def sample_request() -> Dict[str, Any]:
     """Returns canonical sample request."""
     model = OCRChunkingRequest(
         oid=2299268,
+        nombre_documento="CTO_EyP_LLA_50_2013.pdf",
         file_name=None,
-        documento_id=7788,
         job_filde_id=4567,
+        usuario_proceso="analista_anh",
+        job_proceso="JOB_OCR_20260309_001",
         created_by=1101,
         metadata={
             "nombre_documento": "CTO_EyP_LLA_50_2013.pdf",
