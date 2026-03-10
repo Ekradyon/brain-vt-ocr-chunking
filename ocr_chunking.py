@@ -1,9 +1,9 @@
-"""
+﻿"""
 OCR + chunking + embeddings orchestrator (FastAPI/OpenAPI, psycopg2, no plpy).
 
 Main goals:
 - Single service file at project root.
-- Required input: oid (PostgreSQL Large Object OID).
+- Required input: oid (PostgreSQL Large Object OID del PDF).
 - Full document processing or first/last N pages.
 - Queue + overwrite policies with clear and traceable states.
 - Docling OCR, semantic/simple chunking, embedding generation, DB persistence.
@@ -29,9 +29,8 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime, timedelta, timezone
 from threading import Lock
-from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Tuple
 
 import fitz
@@ -52,7 +51,19 @@ from transformers import AutoModel, AutoTokenizer
 
 SERVICE_NAME = "OCR Chunking Embeddings Orchestrator"
 SERVICE_VERSION = "2.0.0"
-SERVICE_TAGS = ["ocr", "chunking", "embeddings", "docling", "postgres", "openapi"]
+TAG_CHUNKING = "Segmento Chunking"
+TAG_EMBEDDING = "Segmento Embedding"
+TAG_OCR = "Segmento Docling-OCR"
+TAG_PIPELINE = "Segmento Pipeline"
+TAG_HELPERS = "Segmento Helpers"
+
+OPENAPI_TAGS = [
+    {"name": TAG_CHUNKING, "description": "Metodos de chunking (texto a chunks)."},
+    {"name": TAG_EMBEDDING, "description": "Metodos de generacion de embeddings."},
+    {"name": TAG_OCR, "description": "Metodos de OCR y extraccion de texto."},
+    {"name": TAG_PIPELINE, "description": "Metodos de orquestacion completa PipelineOCR."},
+    {"name": TAG_HELPERS, "description": "Endpoints auxiliares: health, example-request, validate-db."},
+]
 
 DEFAULT_QUEUE_NAME = "BRAINVT_OCR_EMBEDDINGS_GPU"
 DEFAULT_JOB_TYPE = "BRAINVT_OCR_EMBEDDINGS_GPU"
@@ -86,11 +97,6 @@ _DOCLING_LOCK = Lock()
 def utc_now_iso() -> str:
     """Returns UTC timestamp as ISO string."""
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-
-
-def bogota_now_iso() -> str:
-    """Returns current timestamp in America/Bogota as ISO string."""
-    return datetime.now(ZoneInfo("America/Bogota")).replace(microsecond=0).isoformat()
 
 
 def safe_str(value: Any, default: str = "") -> str:
@@ -151,6 +157,39 @@ def to_json_dict(value: Any, default: Optional[Dict[str, Any]] = None) -> Dict[s
         except Exception:
             return dict(default)
     return dict(default)
+
+
+def to_json_safe(value: Any) -> Any:
+    """Converts values to JSON-safe structures (datetime -> ISO, etc.)."""
+    if isinstance(value, dict):
+        return {safe_str(k): to_json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [to_json_safe(v) for v in value]
+    if isinstance(value, tuple):
+        return [to_json_safe(v) for v in value]
+    if isinstance(value, set):
+        return [to_json_safe(v) for v in sorted(value, key=lambda x: safe_str(x))]
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8", errors="replace")
+        except Exception:
+            return safe_str(value, "")
+    return value
+
+
+def json_dumps_safe(value: Any) -> str:
+    """JSON dump that never fails on datetime/date/bytes."""
+    return json.dumps(to_json_safe(value), ensure_ascii=False)
+
+
+def normalize_file_name(value: Any) -> str:
+    """Normaliza nombre de archivo a basename limpio."""
+    raw = safe_str(value, "").strip()
+    if not raw:
+        return ""
+    return os.path.basename(raw.replace("\\", "/")).strip()
 
 
 def pydantic_model_dump(model: BaseModel) -> Dict[str, Any]:
@@ -238,18 +277,96 @@ class PostgresSettings:
     @staticmethod
     def from_env() -> "PostgresSettings":
         """Loads DB settings from environment."""
-        port_raw = os.getenv("OCR_DB_PORT", "5432")
-        try:
-            port = int(port_raw)
-        except ValueError:
-            port = 5432
         return PostgresSettings(
-            host=os.getenv("OCR_DB_HOST", "<DB_HOST>"),
-            port=port,
-            dbname=os.getenv("OCR_DB_NAME", "<DB_NAME>"),
-            user=os.getenv("OCR_DB_USER", "<DB_USER>"),
-            password=os.getenv("OCR_DB_PASSWORD", "<DB_PASSWORD>"),
+            host=os.getenv("OCR_DB_HOST", "localhost"),
+            port=int(os.getenv("OCR_DB_PORT", "5432")),
+            dbname=os.getenv("OCR_DB_NAME", "niledb"),
+            user=os.getenv("OCR_DB_USER", "postgres"),
+            password=os.getenv("OCR_DB_PASSWORD", "plexia"),
         )
+
+
+def bogota_now_iso() -> str:
+    """Returns current time in America/Bogota offset as ISO string."""
+    bogota_tz = timezone(timedelta(hours=-5))
+    return datetime.now(bogota_tz).replace(microsecond=0).isoformat()
+
+
+def _validate_db_connection() -> Dict[str, Any]:
+    """
+    Valida conexión a Postgres.
+    Retorna versión, metadatos y resultado de una consulta de prueba.
+    """
+    settings = PostgresSettings.from_env()
+    try:
+        conn = psycopg2.connect(
+            host=settings.host,
+            port=settings.port,
+            dbname=settings.dbname,
+            user=settings.user,
+            password=settings.password,
+            connect_timeout=5,
+        )
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT current_database() AS current_database, current_user AS current_user, version() AS version;"
+                )
+                row = cur.fetchone()
+                if not row:
+                    return {
+                        "status": "error",
+                        "message": "No se obtuvo fila de metadatos.",
+                        "postgres_version": None,
+                        "metadata": None,
+                        "test_query": None,
+                        "error": "Empty result",
+                    }
+                version_str = row["version"] or ""
+                version_short = version_str.split(",")[0].strip() if version_str else None
+                metadata = {
+                    "current_database": row["current_database"],
+                    "current_user": row["current_user"],
+                    "server_version_full": version_str,
+                    "server_version_short": version_short,
+                    "connection": {
+                        "host": settings.host,
+                        "port": settings.port,
+                        "dbname": settings.dbname,
+                        "user": settings.user,
+                    },
+                }
+                cur.execute(
+                    "SELECT 1 AS ping, current_timestamp AS server_time, "
+                    "current_setting('server_version_num') AS version_num;"
+                )
+                test_row = cur.fetchone()
+                test_query = dict(test_row) if test_row else None
+            return {
+                "status": "ok",
+                "message": "Conexión exitosa.",
+                "postgres_version": version_short,
+                "metadata": metadata,
+                "test_query": test_query,
+                "error": None,
+            }
+        finally:
+            conn.close()
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": "No se pudo conectar a Postgres.",
+            "postgres_version": None,
+            "metadata": {
+                "connection": {
+                    "host": settings.host,
+                    "port": settings.port,
+                    "dbname": settings.dbname,
+                }
+            },
+            "test_query": None,
+            "error": str(exc),
+        }
 
 
 class PostgresClient:
@@ -335,6 +452,73 @@ class PostgresClient:
         WHERE i."loOid" = %s
         ORDER BY i."trabajoId" DESC, i.id DESC
         LIMIT 1
+        """
+        return self.query_one(sql, (int(oid),))
+
+    def fetch_documento_by_metadata_oid(self, oid: int) -> Optional[Dict[str, Any]]:
+        """Resuelve GestorDocumental.Documentos por metadatosExtra.ocr.metadata.oid."""
+        sql_json = """
+        SELECT
+          d."id"           AS documento_id,
+          d."archivoNombre" AS archivo_nombre,
+          d."estado"        AS estado_documento,
+          d."createdBy"     AS created_by,
+          d."updatedAt"     AS updated_at
+        FROM "GestorDocumental"."Documentos" d
+        WHERE COALESCE((d."metadatosExtra"::jsonb -> 'ocr' -> 'metadata' ->> 'oid'), '') ~ '^[0-9]+$'
+          AND ((d."metadatosExtra"::jsonb -> 'ocr' -> 'metadata' ->> 'oid')::bigint = %s)
+        ORDER BY d."updatedAt" DESC NULLS LAST, d."id" DESC
+        LIMIT 1
+        """
+        try:
+            return self.query_one(sql_json, (int(oid),))
+        except Exception:
+            # Fallback robusto cuando el tipo/estructura de metadatosExtra no permite cast a jsonb.
+            pattern = f'"oid"\\s*:\\s*{int(oid)}(?:[^0-9]|$)'
+            sql_text = """
+            SELECT
+              d."id"            AS documento_id,
+              d."archivoNombre" AS archivo_nombre,
+              d."estado"        AS estado_documento,
+              d."createdBy"     AS created_by,
+              d."updatedAt"     AS updated_at
+            FROM "GestorDocumental"."Documentos" d
+            WHERE COALESCE(d."metadatosExtra"::text, '') ~ %s
+            ORDER BY d."updatedAt" DESC NULLS LAST, d."id" DESC
+            LIMIT 1
+            """
+            return self.query_one(sql_text, (pattern,))
+
+    def fetch_documento_by_file_name(self, file_name: str) -> Optional[Dict[str, Any]]:
+        """Resuelve GestorDocumental.Documentos por archivoNombre (fallback operativo)."""
+        normalized = normalize_file_name(file_name)
+        if not normalized:
+            return None
+        sql = """
+        SELECT
+          d."id"            AS documento_id,
+          d."archivoNombre" AS archivo_nombre,
+          d."estado"        AS estado_documento,
+          d."createdBy"     AS created_by,
+          d."updatedAt"     AS updated_at
+        FROM "GestorDocumental"."Documentos" d
+        WHERE lower(COALESCE(d."archivoNombre", '')) = lower(%s)
+           OR lower(COALESCE(d."archivoNombre", '')) = lower(%s)
+        ORDER BY d."updatedAt" DESC NULLS LAST, d."id" DESC
+        LIMIT 1
+        """
+        return self.query_one(sql, (normalized, safe_str(file_name, "").strip()))
+
+    def fetch_large_object_stats(self, oid: int) -> Optional[Dict[str, Any]]:
+        """Obtiene paginas/bytes aproximados del pg_largeobject para trazabilidad."""
+        sql = """
+        SELECT
+          l.loid AS oid,
+          COUNT(*)::int AS paginas,
+          ((MAX(l.pageno) + 1) * 2048)::bigint AS bytes_aprox
+        FROM pg_largeobject l
+        WHERE l.loid = %s
+        GROUP BY l.loid
         """
         return self.query_one(sql, (int(oid),))
 
@@ -477,7 +661,7 @@ class PostgresClient:
                 estado,
                 int(prioridad),
                 documento_id,
-                json.dumps(parametros, ensure_ascii=False),
+                json_dumps_safe(parametros),
                 int(max_intentos),
                 estado,
             ),
@@ -502,7 +686,7 @@ class PostgresClient:
 
         if resultado is not None:
             sets.append('"resultado" = %s')
-            params.append(json.dumps(resultado, ensure_ascii=False))
+            params.append(json_dumps_safe(resultado))
         if error_message is not None:
             sets.append('"errorMensaje" = %s')
             params.append(error_message)
@@ -665,7 +849,6 @@ class EmbeddingOptions(BaseModel):
     )
     save_to_db: bool = Field(default=True)
     return_vectors: bool = Field(default=False)
-    require_documento_id: bool = Field(default=True)
     require_inserted_rows: bool = Field(default=True)
     created_by_default: int = Field(default=DEFAULT_CREATED_BY)
 
@@ -682,12 +865,32 @@ class MockOptions(BaseModel):
 class OCRChunkingRequest(BaseModel):
     """Input request model."""
 
-    oid: int = Field(..., description="Required pg_largeobject OID.")
-    file_name: Optional[str] = Field(default=None, description="Optional file name; if missing, resolve by loOid.")
-    documento_id: Optional[int] = Field(default=None)
+    oid: int = Field(
+        ...,
+        description=(
+            "OID del Large Object (pg_largeobject) del PDF a procesar. "
+            "El documentoId de GestorDocumental se resuelve internamente por metadata/nombre."
+        ),
+    )
+    nombre_documento: Optional[str] = Field(
+        default=None,
+        description="Nombre del documento. Si se envia, no se intenta resolver nombre por OID.",
+    )
+    file_name: Optional[str] = Field(
+        default=None,
+        description="Alias opcional de nombre_documento para compatibilidad.",
+    )
     job_filde_id: Optional[int] = Field(
         default=None,
         description="Id de archivo/job para trazabilidad (compatibilidad con nombre solicitado).",
+    )
+    usuario_proceso: Optional[str] = Field(
+        default=None,
+        description="Usuario funcional que ejecuta la solicitud.",
+    )
+    job_proceso: Optional[str] = Field(
+        default=None,
+        description="Nombre o identificador funcional del job de negocio.",
     )
     created_by: Optional[int] = Field(default=None)
     metadata: Dict[str, Any] = Field(
@@ -709,9 +912,11 @@ class OCRChunkingRequest(BaseModel):
         "json_schema_extra": {
             "example": {
                 "oid": 2299268,
+                "nombre_documento": "CTO_EyP_LLA_50_2013.pdf",
                 "file_name": None,
-                "documento_id": 7788,
                 "job_filde_id": 4567,
+                "usuario_proceso": "analista_anh",
+                "job_proceso": "JOB_OCR_20260309_001",
                 "created_by": 1101,
                 "metadata": {
                     "nombre_documento": "CTO_EyP_LLA_50_2013.pdf",
@@ -1195,20 +1400,26 @@ def build_job_payload(
     request: OCRChunkingRequest,
     file_name: str,
     item_info: Optional[Dict[str, Any]],
+    documento_info: Optional[Dict[str, Any]],
     stage: str,
 ) -> Dict[str, Any]:
     """Builds compact payload for Operaciones.JobsProcesamiento."""
+    documento_id_real = safe_int((documento_info or {}).get("documento_id"), None)
     return {
         "pipeline": "OCR_CHUNKING_SERVICE",
         "stage": stage,
         "oid": int(request.oid),
+        "oid_documento": int(request.oid),
+        "documento_id_real": documento_id_real,
         "file_name": file_name,
-        "documento_id": request.documento_id,
+        "usuario_proceso": request.usuario_proceso,
+        "job_proceso": request.job_proceso,
         "job_filde_id": request.job_filde_id,
         "queue_name": DEFAULT_QUEUE_NAME,
         "overwrite_enabled": request.overwrite.enabled,
         "metadata": request.metadata,
-        "resolved_item": item_info or {},
+        "resolved_item": to_json_safe(item_info or {}),
+        "resolved_documento": to_json_safe(documento_info or {}),
         "created_at_utc": utc_now_iso(),
     }
 
@@ -1313,7 +1524,10 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
     job_type = DEFAULT_JOB_TYPE if stage_key == "pipeline" else f"{DEFAULT_JOB_TYPE}_{stage_key.upper()}"
     job_id: Optional[int] = None
     item_info: Optional[Dict[str, Any]] = None
-    file_name = safe_str(request.file_name, "").strip()
+    documento_info: Optional[Dict[str, Any]] = None
+    oid_stats: Optional[Dict[str, Any]] = None
+    file_name = normalize_file_name(request.nombre_documento or request.file_name)
+    documento_id: Optional[int] = None
 
     recorder.push("REQUEST_VALIDATION", "OK", "Request recibida.", {"oid": int(request.oid), "stage": stage_key})
 
@@ -1333,30 +1547,135 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
             data={"oid": int(request.oid), "stage": stage_key},
         )
 
+    def _create_job_guarded(
+        db: PostgresClient,
+        estado: str,
+        prioridad: int,
+        parametros: Dict[str, Any],
+        max_intentos: int,
+    ) -> int:
+        """Crea job y traduce errores FK a PipelineError legible."""
+        try:
+            return db.create_job(
+                job_type=job_type,
+                estado=estado,
+                prioridad=prioridad,
+                documento_id=documento_id,
+                parametros=parametros,
+                max_intentos=max_intentos,
+            )
+        except psycopg2.errors.ForeignKeyViolation as exc:
+            raise PipelineError(
+                "JOB_CREATE",
+                "INVALID_DOCUMENTO_REFERENCE",
+                (
+                    "documentoId no existe en GestorDocumental.Documentos. "
+                    "El OID no se debe usar directamente como documentoId."
+                ),
+                {
+                    "oid": int(request.oid),
+                    "documento_id_resuelto": documento_id,
+                    "hint": (
+                        "Verifique metadatosExtra.ocr.metadata.oid o la coincidencia por archivoNombre "
+                        "para resolver un documentoId valido."
+                    ),
+                    "db_error": str(exc),
+                },
+            ) from exc
+
     try:
         with PostgresClient(PostgresSettings.from_env()) as db:
-            item_info = db.fetch_item_by_oid(int(request.oid))
-            if item_info is None:
-                raise PipelineError(
-                    "LOAD_ITEM",
-                    "OID_NOT_FOUND",
-                    "No se encontro item por loOid.",
+            oid_stats = db.fetch_large_object_stats(int(request.oid))
+            if oid_stats:
+                recorder.push(
+                    "LOAD_OID_INFO",
+                    "OK",
+                    "Resumen de pg_largeobject obtenido.",
+                    {
+                        "oid": safe_int(oid_stats.get("oid"), None),
+                        "paginas_aprox": safe_int(oid_stats.get("paginas"), None),
+                        "bytes_aprox": safe_int(oid_stats.get("bytes_aprox"), None),
+                    },
+                )
+            else:
+                recorder.push(
+                    "LOAD_OID_INFO",
+                    "WARN",
+                    "No se encontraron metadatos de pg_largeobject para el OID.",
                     {"oid": int(request.oid)},
                 )
-            if not file_name:
-                file_name = safe_str(item_info.get("nombre_archivo"), "").strip()
-            if not file_name:
-                file_name = f"oid_{int(request.oid)}.pdf"
-            recorder.push(
-                "LOAD_ITEM",
-                "OK",
-                "Item resuelto por OID.",
-                {
-                    "item_id": safe_int(item_info.get("item_id"), None),
-                    "file_name": file_name,
-                    "estado_item": safe_str(item_info.get("estado"), ""),
-                },
-            )
+
+            if file_name:
+                recorder.push(
+                    "LOAD_ITEM",
+                    "SKIPPED",
+                    "Nombre de documento recibido en request; no se consulta nombre por OID.",
+                    {"file_name": file_name},
+                )
+            else:
+                item_info = db.fetch_item_by_oid(int(request.oid))
+                if item_info is not None:
+                    file_name = normalize_file_name(item_info.get("nombre_archivo"))
+                    recorder.push(
+                        "LOAD_ITEM",
+                        "OK",
+                        "Item resuelto por OID.",
+                        {
+                            "item_id": safe_int(item_info.get("item_id"), None),
+                            "file_name": file_name,
+                            "estado_item": safe_str(item_info.get("estado"), ""),
+                        },
+                    )
+                if not file_name:
+                    file_name = f"documento_{int(request.oid)}.pdf"
+                    recorder.push(
+                        "LOAD_ITEM",
+                        "WARN",
+                        "No se encontro nombre por OID; se usa nombre por defecto.",
+                        {"file_name": file_name},
+                    )
+
+            # Resuelve documentoId real (FK) por OID dentro de metadatosExtra y fallback por nombre de archivo.
+            documento_info = db.fetch_documento_by_metadata_oid(int(request.oid))
+            if documento_info is not None:
+                documento_id = safe_int(documento_info.get("documento_id"), None)
+                recorder.push(
+                    "LOAD_DOCUMENT",
+                    "OK",
+                    "Documento resuelto por metadatosExtra.ocr.metadata.oid.",
+                    {
+                        "documento_id": documento_id,
+                        "archivo_nombre": safe_str(documento_info.get("archivo_nombre"), ""),
+                    },
+                )
+            elif file_name:
+                documento_info = db.fetch_documento_by_file_name(file_name)
+                if documento_info is not None:
+                    documento_id = safe_int(documento_info.get("documento_id"), None)
+                    recorder.push(
+                        "LOAD_DOCUMENT",
+                        "OK",
+                        "Documento resuelto por archivoNombre (fallback).",
+                        {
+                            "documento_id": documento_id,
+                            "archivo_nombre": safe_str(documento_info.get("archivo_nombre"), ""),
+                            "file_name_input": file_name,
+                        },
+                    )
+                else:
+                    recorder.push(
+                        "LOAD_DOCUMENT",
+                        "WARN",
+                        "No se resolvio documentoId en GestorDocumental.Documentos; se usara null en FK.",
+                        {"oid": int(request.oid), "file_name": file_name},
+                    )
+            else:
+                recorder.push(
+                    "LOAD_DOCUMENT",
+                    "WARN",
+                    "No se resolvio documentoId en GestorDocumental.Documentos; se usara null en FK.",
+                    {"oid": int(request.oid)},
+                )
 
             if request.queue.enabled:
                 queue_info = db.ensure_queue(
@@ -1371,18 +1690,17 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
             else:
                 recorder.push("QUEUE_SETUP", "SKIPPED", "Queue deshabilitada.")
 
-            payload = build_job_payload(request, file_name, item_info, stage_key)
+            payload = build_job_payload(request, file_name, item_info, documento_info, stage_key)
 
             if request.queue.enabled:
                 slot = db.acquire_queue_slot(queue_name)
                 queue_slot_acquired = bool(slot.get("acquired"))
                 if not queue_slot_acquired:
                     if request.queue.queue_when_busy:
-                        job_id = db.create_job(
-                            job_type=job_type,
+                        job_id = _create_job_guarded(
+                            db=db,
                             estado="PENDIENTE",
                             prioridad=40,
-                            documento_id=request.documento_id,
                             parametros=payload,
                             max_intentos=3,
                         )
@@ -1420,17 +1738,24 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                     {"queue_name": queue_name, "queue_state": slot.get("queue")},
                 )
 
-            job_id = db.create_job(
-                job_type=job_type,
+            job_id = _create_job_guarded(
+                db=db,
                 estado="EN_PROCESO",
                 prioridad=40,
-                documento_id=request.documento_id,
                 parametros=payload,
                 max_intentos=3,
             )
             update_job_progress(db, job_id, recorder, "RUNNING", "QUEUE_ADMISSION", {"job_id": job_id})
 
-            pdf_bytes = db.read_large_object(int(request.oid))
+            try:
+                pdf_bytes = db.read_large_object(int(request.oid))
+            except Exception as exc:
+                raise PipelineError(
+                    "LOAD_BINARY",
+                    "OID_READ_FAILED",
+                    "No fue posible leer el binary del OID solicitado.",
+                    {"oid": int(request.oid), "error": f"{type(exc).__name__}: {str(exc)}"},
+                ) from exc
             if not pdf_bytes:
                 raise PipelineError("LOAD_BINARY", "EMPTY_BINARY", "Large object vacio.")
             binary_sha256 = hashlib.sha256(pdf_bytes).hexdigest()
@@ -1572,25 +1897,26 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
 
             inserted_rows = 0
             if run_persist_stage:
-                documento_id = request.documento_id
-                if request.embedding.require_documento_id and documento_id is None:
-                    raise PipelineError(
-                        "OVERWRITE_CHECK",
-                        "DOCUMENTO_ID_REQUIRED",
-                        "documento_id es obligatorio para persistir embeddings.",
-                    )
-
-                existing_count = db.count_existing_embeddings(documento_id=documento_id)
+                existing_count = 0
                 deleted_count = 0
-                if existing_count > 0 and not request.overwrite.enabled:
-                    raise PipelineError(
+                if documento_id is not None:
+                    existing_count = db.count_existing_embeddings(documento_id=documento_id)
+                    if existing_count > 0 and not request.overwrite.enabled:
+                        raise PipelineError(
+                            "OVERWRITE_CHECK",
+                            "DUPLICATE_EMBEDDINGS",
+                            "Ya existen embeddings para el documento y overwrite.enabled=false.",
+                            {"documento_id": documento_id, "existing_count": existing_count},
+                        )
+                    if existing_count > 0 and request.overwrite.enabled:
+                        deleted_count = db.delete_existing_embeddings(documento_id=documento_id)
+                else:
+                    recorder.push(
                         "OVERWRITE_CHECK",
-                        "DUPLICATE_EMBEDDINGS",
-                        "Ya existen embeddings para el documento y overwrite.enabled=false.",
-                        {"documento_id": documento_id, "existing_count": existing_count},
+                        "WARN",
+                        "documentoId no resuelto; no se valida/borra duplicados por documento.",
+                        {"oid": int(request.oid), "overwrite_enabled": bool(request.overwrite.enabled)},
                     )
-                if existing_count > 0 and request.overwrite.enabled:
-                    deleted_count = db.delete_existing_embeddings(documento_id=documento_id)
 
                 recorder.push(
                     "OVERWRITE_CHECK",
@@ -1612,14 +1938,19 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                     metadata_row = {
                         "oid": int(request.oid),
                         "file_name": file_name,
+                        "usuario_proceso": request.usuario_proceso,
+                        "job_proceso": request.job_proceso,
                         "phase": "PERSIST",
                         "item_id": safe_int(item_info.get("item_id"), None) if item_info else None,
                         "probe": probe,
                         "engine_used": engine,
+                        "documento_id_resuelto": documento_id,
+                        "documento_info": to_json_safe(documento_info or {}),
+                        "oid_stats": to_json_safe(oid_stats or {}),
                         "page_selection": page_info,
                         "chunk_strategy": chunking_method,
                         "chunk_chars": len(chunk),
-                        "request_metadata": request.metadata,
+                        "request_metadata_input": request.metadata,
                     }
                     row_values.append(
                         (
@@ -1630,14 +1961,42 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                             int(created_by),
                             documento_id,
                             request.job_filde_id,
-                            json.dumps(metadata_row, ensure_ascii=False),
+                            json_dumps_safe(metadata_row),
                             request.embedding.model_name,
                             int(tokens_per_chunk[idx]) if idx < len(tokens_per_chunk) else 0,
                             vector_literal,
                         )
                     )
 
-                inserted_rows = db.insert_embeddings(row_values)
+                try:
+                    inserted_rows = db.insert_embeddings(row_values)
+                except psycopg2.errors.ForeignKeyViolation as exc:
+                    raise PipelineError(
+                        "PERSIST",
+                        "INVALID_DOCUMENTO_REFERENCE",
+                        "No fue posible insertar embeddings por referencia documentoId invalida.",
+                        {
+                            "documento_id_resuelto": documento_id,
+                            "oid": int(request.oid),
+                            "hint": "Valide mapeo entre OID y GestorDocumental.Documentos.id.",
+                            "db_error": str(exc),
+                        },
+                    ) from exc
+                except psycopg2.errors.NotNullViolation as exc:
+                    raise PipelineError(
+                        "PERSIST",
+                        "MISSING_REQUIRED_DOCUMENTO_ID",
+                        "La tabla de embeddings exige documentoId y no fue posible resolverlo.",
+                        {
+                            "documento_id_resuelto": documento_id,
+                            "oid": int(request.oid),
+                            "hint": (
+                                "Registre/actualice el documento en GestorDocumental.Documentos con "
+                                "metadatosExtra.ocr.metadata.oid o archivoNombre trazable."
+                            ),
+                            "db_error": str(exc),
+                        },
+                    ) from exc
                 if request.embedding.require_inserted_rows and inserted_rows <= 0:
                     raise PipelineError(
                         "PERSIST",
@@ -1660,9 +2019,14 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                 "stage": stage_key,
                 "job_id": job_id,
                 "file_name": file_name,
-                "item_id": safe_int(item_info.get("item_id"), None),
-                "documento_id": request.documento_id,
+                "item_id": safe_int(item_info.get("item_id"), None) if item_info else None,
+                "oid_documento": int(request.oid),
+                "documento_id_resuelto": documento_id,
+                "documento_info": to_json_safe(documento_info or {}),
+                "oid_stats": to_json_safe(oid_stats or {}),
                 "job_filde_id": request.job_filde_id,
+                "usuario_proceso": request.usuario_proceso,
+                "job_proceso": request.job_proceso,
                 "queue_name": queue_name if request.queue.enabled else None,
                 "binary_sha256": binary_sha256,
                 "engine_used": engine,
@@ -1845,9 +2209,11 @@ def sample_request() -> Dict[str, Any]:
     """Returns canonical sample request."""
     model = OCRChunkingRequest(
         oid=2299268,
+        nombre_documento="CTO_EyP_LLA_50_2013.pdf",
         file_name=None,
-        documento_id=7788,
         job_filde_id=4567,
+        usuario_proceso="analista_anh",
+        job_proceso="JOB_OCR_20260309_001",
         created_by=1101,
         metadata={
             "nombre_documento": "CTO_EyP_LLA_50_2013.pdf",
@@ -1875,6 +2241,7 @@ def sample_request() -> Dict[str, Any]:
 app = FastAPI(
     title=SERVICE_NAME,
     version=SERVICE_VERSION,
+    openapi_tags=OPENAPI_TAGS,
     description=(
         "Servicio OpenAPI para OCR, chunking y embeddings.\n"
         "Rutas funcionales: /ocr-docling, /chunking-docling, /embedding-generation, /PipelineOCR.\n"
@@ -1883,78 +2250,7 @@ app = FastAPI(
 )
 
 
-def _validate_db_connection() -> Dict[str, Any]:
-    """
-    Valida conexión a Postgres (misma lógica que validate_db.py).
-    Retorna versión, metadatos y resultado de una consulta de prueba.
-    """
-    settings = PostgresSettings.from_env()
-    try:
-        conn = psycopg2.connect(
-            host=settings.host,
-            port=settings.port,
-            dbname=settings.dbname,
-            user=settings.user,
-            password=settings.password,
-            connect_timeout=5,
-        )
-        try:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(
-                    "SELECT current_database() AS current_database, current_user AS current_user, version() AS version;"
-                )
-                row = cur.fetchone()
-                if not row:
-                    return {
-                        "status": "error",
-                        "message": "No se obtuvo fila de metadatos.",
-                        "postgres_version": None,
-                        "metadata": None,
-                        "test_query": None,
-                        "error": "Empty result",
-                    }
-                version_str = row["version"] or ""
-                version_short = version_str.split(",")[0].strip() if version_str else None
-                metadata = {
-                    "current_database": row["current_database"],
-                    "current_user": row["current_user"],
-                    "server_version_full": version_str,
-                    "server_version_short": version_short,
-                    "connection": {
-                        "host": settings.host,
-                        "port": settings.port,
-                        "dbname": settings.dbname,
-                        "user": settings.user,
-                    },
-                }
-                cur.execute(
-                    "SELECT 1 AS ping, current_timestamp AS server_time, "
-                    "current_setting('server_version_num') AS version_num;"
-                )
-                test_row = cur.fetchone()
-                test_query = dict(test_row) if test_row else None
-            return {
-                "status": "ok",
-                "message": "Conexión exitosa.",
-                "postgres_version": version_short,
-                "metadata": metadata,
-                "test_query": test_query,
-                "error": None,
-            }
-        finally:
-            conn.close()
-    except Exception as exc:
-        return {
-            "status": "error",
-            "message": "No se pudo conectar a Postgres.",
-            "postgres_version": None,
-            "metadata": {"connection": {"host": settings.host, "port": settings.port, "dbname": settings.dbname}},
-            "test_query": None,
-            "error": str(exc),
-        }
-
-
-@app.get("/health", tags=SERVICE_TAGS)
+@app.get("/health", tags=[TAG_HELPERS])
 def health() -> Dict[str, Any]:
     """Health endpoint."""
     return {
@@ -1966,25 +2262,25 @@ def health() -> Dict[str, Any]:
     }
 
 
-@app.get("/example-request", tags=SERVICE_TAGS)
+@app.get("/example-request", tags=[TAG_HELPERS])
 def example_request() -> Dict[str, Any]:
     """Returns request payload example."""
     return {"input": sample_request()}
 
 
-@app.get("/validate-db", tags=SERVICE_TAGS)
+@app.get("/validate-db", tags=[TAG_HELPERS])
 def validate_db() -> Dict[str, Any]:
     """
-    Valida la conexión a Postgres a nivel API (misma lógica que validate_db.py).
-    Retorna versión de PostgreSQL, metadatos de conexión y resultado de una consulta de prueba.
+    Valida conexión a Postgres a nivel API.
+    Retorna versión, metadatos y una consulta de prueba.
     """
     result = _validate_db_connection()
     result["timestamp"] = bogota_now_iso()
     result["service"] = SERVICE_NAME
-    return result
+    return to_json_safe(result)
 
 
-@app.post("/ocr-docling/process", response_model=OCRChunkingResponse, tags=SERVICE_TAGS)
+@app.post("/ocr-docling/process", response_model=OCRChunkingResponse, tags=[TAG_OCR])
 def ocr_docling_process(payload: Dict[str, Any]) -> OCRChunkingResponse:
     """Ejecuta solo OCR + limpieza de texto."""
     input_payload = payload.get("input", payload)
@@ -1995,7 +2291,7 @@ def ocr_docling_process(payload: Dict[str, Any]) -> OCRChunkingResponse:
     return process_request(request, stage="ocr")
 
 
-@app.post("/ocr-docling/process-batch", response_model=OCRChunkingBatchResponse, tags=SERVICE_TAGS)
+@app.post("/ocr-docling/process-batch", response_model=OCRChunkingBatchResponse, tags=[TAG_OCR])
 def ocr_docling_batch(payload: Dict[str, Any]) -> OCRChunkingBatchResponse:
     """Ejecuta OCR + limpieza para varios documentos."""
     input_payload = payload.get("input", payload)
@@ -2006,7 +2302,7 @@ def ocr_docling_batch(payload: Dict[str, Any]) -> OCRChunkingBatchResponse:
     return process_batch(request, stage="ocr")
 
 
-@app.post("/chunking-docling/process", response_model=OCRChunkingResponse, tags=SERVICE_TAGS)
+@app.post("/chunking-docling/process", response_model=OCRChunkingResponse, tags=[TAG_CHUNKING])
 def chunking_docling_process(payload: Dict[str, Any]) -> OCRChunkingResponse:
     """Ejecuta OCR + limpieza + chunking."""
     input_payload = payload.get("input", payload)
@@ -2017,7 +2313,7 @@ def chunking_docling_process(payload: Dict[str, Any]) -> OCRChunkingResponse:
     return process_request(request, stage="chunking")
 
 
-@app.post("/chunking-docling/process-batch", response_model=OCRChunkingBatchResponse, tags=SERVICE_TAGS)
+@app.post("/chunking-docling/process-batch", response_model=OCRChunkingBatchResponse, tags=[TAG_CHUNKING])
 def chunking_docling_batch(payload: Dict[str, Any]) -> OCRChunkingBatchResponse:
     """Ejecuta OCR + limpieza + chunking para varios documentos."""
     input_payload = payload.get("input", payload)
@@ -2028,7 +2324,7 @@ def chunking_docling_batch(payload: Dict[str, Any]) -> OCRChunkingBatchResponse:
     return process_batch(request, stage="chunking")
 
 
-@app.post("/embedding-generation/process", response_model=OCRChunkingResponse, tags=SERVICE_TAGS)
+@app.post("/embedding-generation/process", response_model=OCRChunkingResponse, tags=[TAG_EMBEDDING])
 def embedding_generation_process(payload: Dict[str, Any]) -> OCRChunkingResponse:
     """Ejecuta OCR + limpieza + chunking + generacion de embeddings."""
     input_payload = payload.get("input", payload)
@@ -2039,7 +2335,7 @@ def embedding_generation_process(payload: Dict[str, Any]) -> OCRChunkingResponse
     return process_request(request, stage="embedding")
 
 
-@app.post("/embedding-generation/process-batch", response_model=OCRChunkingBatchResponse, tags=SERVICE_TAGS)
+@app.post("/embedding-generation/process-batch", response_model=OCRChunkingBatchResponse, tags=[TAG_EMBEDDING])
 def embedding_generation_batch(payload: Dict[str, Any]) -> OCRChunkingBatchResponse:
     """Ejecuta generacion de embeddings para varios documentos."""
     input_payload = payload.get("input", payload)
@@ -2050,7 +2346,7 @@ def embedding_generation_batch(payload: Dict[str, Any]) -> OCRChunkingBatchRespo
     return process_batch(request, stage="embedding")
 
 
-@app.post("/PipelineOCR/process", response_model=OCRChunkingResponse, tags=SERVICE_TAGS)
+@app.post("/PipelineOCR/process", response_model=OCRChunkingResponse, tags=[TAG_PIPELINE])
 def pipeline_ocr_process(payload: Dict[str, Any]) -> OCRChunkingResponse:
     """Orquesta todo el flujo: OCR, limpieza, chunking, embeddings e insercion."""
     input_payload = payload.get("input", payload)
@@ -2061,7 +2357,7 @@ def pipeline_ocr_process(payload: Dict[str, Any]) -> OCRChunkingResponse:
     return process_request(request, stage="pipeline")
 
 
-@app.post("/PipelineOCR/process-batch", response_model=OCRChunkingBatchResponse, tags=SERVICE_TAGS)
+@app.post("/PipelineOCR/process-batch", response_model=OCRChunkingBatchResponse, tags=[TAG_PIPELINE])
 def pipeline_ocr_batch(payload: Dict[str, Any]) -> OCRChunkingBatchResponse:
     """Orquesta flujo completo para varios documentos."""
     input_payload = payload.get("input", payload)
