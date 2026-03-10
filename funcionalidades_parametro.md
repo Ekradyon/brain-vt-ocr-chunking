@@ -12,6 +12,7 @@ Descripcion de que hace cada parametro en el payload `input`.
   2) fallback por `archivoNombre`.
 - Si no logra resolver `documento_id`, persiste con `documentoId=null` (si el esquema lo permite) y deja traza en fases.
 - Si no se envia: `422`.
+- Nota operativa: cuando se resuelve `documento_id`, el OCR limpio se escribe en `GestorDocumental.Documentos.contenidoTexto`.
 
 ## `nombre_documento`
 - Tipo: `string`.

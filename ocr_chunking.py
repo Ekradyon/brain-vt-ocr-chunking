@@ -71,6 +71,12 @@ DEFAULT_CREATED_BY = 1101
 DEFAULT_TIMEOUT_SECONDS = 1800
 DEFAULT_PROBE_MAX_PAGES = 60
 DEFAULT_EMBEDDING_MODEL = "intfloat/multilingual-e5-large-instruct"
+SERVICE_STAGE_ENDPOINTS = {
+    "ocr": "/ocr-docling/process",
+    "chunking": "/chunking-docling/process",
+    "embedding": "/embedding-generation/process",
+    "pipeline": "/PipelineOCR/process",
+}
 
 PAGE_INDICATOR_PATTERN = re.compile(
     r"(?i)^\s*(?:pagina\s+\d+\s+de\s+\d+|page\s+\d+|\-\s*\d+\s*\-|\[\d+\])\s*$",
@@ -521,6 +527,51 @@ class PostgresClient:
         GROUP BY l.loid
         """
         return self.query_one(sql, (int(oid),))
+
+    def update_documento_ocr_text(
+        self,
+        documento_id: int,
+        contenido_texto: str,
+        contenido_hash: str,
+        calidad_ocr: Optional[float],
+        paginas: Optional[int],
+        palabras: int,
+        updated_by: Optional[int],
+    ) -> Optional[Dict[str, Any]]:
+        """Actualiza contenido OCR en GestorDocumental.Documentos."""
+        sql = """
+        UPDATE "GestorDocumental"."Documentos"
+        SET
+          "contenidoTexto" = %s,
+          "contenidoHash" = %s,
+          "ocrAplicado" = true,
+          "calidadOcr" = COALESCE(%s, "calidadOcr"),
+          "paginas" = COALESCE(%s, "paginas"),
+          "palabras" = %s,
+          "updatedAt" = (CURRENT_TIMESTAMP AT TIME ZONE 'America/Bogota'),
+          "updatedBy" = COALESCE(%s, "updatedBy")
+        WHERE "id" = %s
+        RETURNING
+          "id" AS documento_id,
+          "archivoNombre" AS archivo_nombre,
+          "ocrAplicado" AS ocr_aplicado,
+          "calidadOcr" AS calidad_ocr,
+          "paginas" AS paginas,
+          "palabras" AS palabras,
+          "updatedAt" AS updated_at
+        """
+        return self.execute_returning_one(
+            sql,
+            (
+                safe_str(contenido_texto, ""),
+                safe_str(contenido_hash, ""),
+                safe_float(calidad_ocr, None),
+                safe_int(paginas, None),
+                int(max(0, safe_int(palabras, 0) or 0)),
+                safe_int(updated_by, None),
+                int(documento_id),
+            ),
+        )
 
     def read_large_object(self, oid: int) -> bytes:
         """Reads pg_largeobject bytes from loOid."""
@@ -1205,6 +1256,11 @@ def clean_text(text: str, cleaning: CleaningOptions) -> Tuple[str, Dict[str, Any
     }
 
 
+def count_words(text: str) -> int:
+    """Cuenta palabras de forma simple y determinista."""
+    return len(re.findall(r"\S+", safe_str(text, "")))
+
+
 def build_docling_document(text: str) -> Any:
     """Builds DoclingDocument from plain text using compatible methods."""
     try:
@@ -1251,11 +1307,35 @@ def simple_chunk_text(text: str, chunk_size: int, overlap: int) -> List[str]:
     return chunks
 
 
-def semantic_chunk_text(text: str, tokenizer: Any) -> List[str]:
-    """Semantic chunking with Docling HybridChunker."""
+def semantic_chunk_text(text: str, tokenizer: Any, model_name: str, max_tokens: int) -> List[str]:
+    """Semantic chunking with Docling HybridChunker using explicit max_tokens."""
     document = build_docling_document(text)
-    chunker = HybridChunker(tokenizer=tokenizer)
-    raw_chunks = list(chunker.chunk(document))
+    effective_max_tokens = max(128, int(max_tokens))
+    attempts: List[Tuple[str, Any]] = []
+    if safe_str(model_name, "").strip():
+        attempts.append(("model_name", safe_str(model_name, "").strip()))
+    if tokenizer is not None:
+        attempts.append(("tokenizer_object", tokenizer))
+    if not attempts:
+        attempts.append(("default_model", DEFAULT_EMBEDDING_MODEL))
+
+    raw_chunks: Optional[List[Any]] = None
+    errors: List[str] = []
+    for source_name, token_source in attempts:
+        try:
+            chunker = HybridChunker(tokenizer=token_source, max_tokens=effective_max_tokens)
+            raw_chunks = list(chunker.chunk(document))
+            break
+        except Exception as exc:
+            errors.append(f"{source_name}: {type(exc).__name__}: {str(exc)}")
+
+    if raw_chunks is None:
+        raise RuntimeError(
+            "HybridChunker fallo con tokenizer/modelo. "
+            + " | ".join(errors)
+            + f" | max_tokens={effective_max_tokens}"
+        )
+
     chunks: List[str] = []
     for chunk in raw_chunks:
         if hasattr(chunk, "text"):
@@ -1522,6 +1602,7 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
     queue_slot_acquired = False
     queue_name = DEFAULT_QUEUE_NAME
     job_type = DEFAULT_JOB_TYPE if stage_key == "pipeline" else f"{DEFAULT_JOB_TYPE}_{stage_key.upper()}"
+    service_endpoint = SERVICE_STAGE_ENDPOINTS.get(stage_key, "/PipelineOCR/process")
     job_id: Optional[int] = None
     item_info: Optional[Dict[str, Any]] = None
     documento_info: Optional[Dict[str, Any]] = None
@@ -1691,6 +1772,7 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                 recorder.push("QUEUE_SETUP", "SKIPPED", "Queue deshabilitada.")
 
             payload = build_job_payload(request, file_name, item_info, documento_info, stage_key)
+            payload["service_endpoint"] = service_endpoint
 
             if request.queue.enabled:
                 slot = db.acquire_queue_slot(queue_name)
@@ -1807,6 +1889,66 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
             recorder.push("TEXT_CLEANING", "OK", "Limpieza aplicada.", cleaning_meta)
             update_job_progress(db, job_id, recorder, "RUNNING", "TEXT_CLEANING")
 
+            # Persistencia temprana del OCR (texto extraido) en GestorDocumental.Documentos.
+            ocr_words = count_words(text_for_chunking)
+            ocr_hash = hashlib.sha256(text_for_chunking.encode("utf-8", errors="replace")).hexdigest()
+            ocr_quality = safe_float(probe.get("extractable_confidence"), None)
+            ocr_pages = safe_int(extraction_meta.get("pages_processed"), None)
+            ocr_updated_by = (
+                request.created_by
+                if request.created_by is not None
+                else request.embedding.created_by_default
+            )
+            ocr_update_info: Optional[Dict[str, Any]] = None
+            if documento_id is not None:
+                ocr_update_info = db.update_documento_ocr_text(
+                    documento_id=documento_id,
+                    contenido_texto=text_for_chunking,
+                    contenido_hash=ocr_hash,
+                    calidad_ocr=ocr_quality,
+                    paginas=ocr_pages,
+                    palabras=ocr_words,
+                    updated_by=ocr_updated_by,
+                )
+                if ocr_update_info is None:
+                    raise PipelineError(
+                        "OCR_PERSIST",
+                        "DOCUMENT_NOT_UPDATED",
+                        "No fue posible actualizar contenidoTexto para el documento resuelto.",
+                        {"documento_id": documento_id, "service_endpoint": service_endpoint},
+                    )
+                recorder.push(
+                    "OCR_PERSIST",
+                    "OK",
+                    "Texto OCR actualizado en GestorDocumental.Documentos.contenidoTexto.",
+                    {
+                        "documento_id": documento_id,
+                        "chars": len(text_for_chunking),
+                        "palabras": ocr_words,
+                        "service_endpoint": service_endpoint,
+                    },
+                )
+            else:
+                recorder.push(
+                    "OCR_PERSIST",
+                    "WARN",
+                    "No se actualiza contenidoTexto: documento_id_resuelto es null.",
+                    {"oid": int(request.oid), "service_endpoint": service_endpoint},
+                )
+            update_job_progress(
+                db,
+                job_id,
+                recorder,
+                "RUNNING",
+                "OCR_PERSIST",
+                {
+                    "service_endpoint": service_endpoint,
+                    "documento_id_resuelto": documento_id,
+                    "ocr_chars": len(text_for_chunking),
+                    "ocr_words": ocr_words,
+                },
+            )
+
             chunks: List[str] = []
             bounds: List[Tuple[int, int]] = []
             chunking_method = "none"
@@ -1818,18 +1960,56 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                         "INVALID_CHUNKING_STRATEGY",
                         "chunking.strategy debe ser semantic o simple.",
                         {"strategy": request.chunking.strategy},
-                    )
+                )
                 chunking_method = chunk_strategy
                 if chunk_strategy == "semantic":
-                    tokenizer_for_chunk = load_tokenizer(request.embedding.model_name)
-                    chunks = semantic_chunk_text(text_for_chunking, tokenizer_for_chunk)
-                    if not chunks and request.chunking.enable_simple_fallback:
-                        chunks = simple_chunk_text(
+                    semantic_max_tokens = max(256, derive_embedding_max_length(request.chunking))
+                    tokenizer_for_chunk: Optional[Any] = None
+                    try:
+                        tokenizer_for_chunk = load_tokenizer(request.embedding.model_name)
+                    except Exception:
+                        tokenizer_for_chunk = None
+                    try:
+                        chunks = semantic_chunk_text(
                             text_for_chunking,
-                            request.chunking.simple_chunk_size,
-                            request.chunking.simple_chunk_overlap,
+                            tokenizer_for_chunk,
+                            request.embedding.model_name,
+                            semantic_max_tokens,
                         )
-                        chunking_method = "simple_fallback"
+                    except Exception as semantic_exc:
+                        semantic_error = f"{type(semantic_exc).__name__}: {str(semantic_exc)}"
+                        force_simple = (
+                            "max_tokens could not be determined automatically" in semantic_error.lower()
+                            or "sentence_bert_config.json" in semantic_error.lower()
+                        )
+                        if force_simple or request.chunking.enable_simple_fallback:
+                            chunks = simple_chunk_text(
+                                text_for_chunking,
+                                request.chunking.simple_chunk_size,
+                                request.chunking.simple_chunk_overlap,
+                            )
+                            chunking_method = (
+                                "simple_forced_semantic_runtime"
+                                if force_simple
+                                else "simple_fallback"
+                            )
+                            recorder.push(
+                                "CHUNKING_WARNING",
+                                "WARN",
+                                "Chunking semantico fallo; se aplico chunking simple.",
+                                {
+                                    "reason": semantic_error,
+                                    "force_simple": force_simple,
+                                    "max_tokens": semantic_max_tokens,
+                                },
+                            )
+                        else:
+                            raise PipelineError(
+                                "CHUNKING",
+                                "SEMANTIC_CHUNKING_FAILED",
+                                "Fallo chunking semantico.",
+                                {"error": semantic_error, "max_tokens": semantic_max_tokens},
+                            ) from semantic_exc
                 else:
                     chunks = simple_chunk_text(
                         text_for_chunking,
@@ -2027,12 +2207,14 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                 "job_filde_id": request.job_filde_id,
                 "usuario_proceso": request.usuario_proceso,
                 "job_proceso": request.job_proceso,
+                "service_endpoint": service_endpoint,
                 "queue_name": queue_name if request.queue.enabled else None,
                 "binary_sha256": binary_sha256,
                 "engine_used": engine,
                 "probe": probe,
                 "page_selection": page_info,
                 "cleaning": cleaning_meta,
+                "ocr_document_update": to_json_safe(ocr_update_info or {}),
                 "chunks_count": len(chunks),
                 "inserted_rows": inserted_rows,
                 "gpu": gpu_metrics(),

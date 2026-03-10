@@ -7,6 +7,7 @@ Servicio OpenAPI para procesar documentos PDF (OCR, chunking y embeddings) desde
 - `oid` es el identificador principal del proceso (LOID del PDF).
 - El `documento_id` real se resuelve internamente en `GestorDocumental.Documentos` por `metadatosExtra.ocr.metadata.oid` y fallback por `archivoNombre`.
 - Si se envia `nombre_documento`, no se consulta el nombre en `ItemsIngestaSmb` por OID.
+- Al terminar OCR+limpieza, el servicio actualiza `GestorDocumental.Documentos.contenidoTexto`.
 
 ## Endpoints por proceso
 
