@@ -29,6 +29,7 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from decimal import Decimal
 from datetime import date, datetime, timedelta, timezone
 from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
@@ -177,6 +178,12 @@ def to_json_safe(value: Any) -> Any:
         return [to_json_safe(v) for v in sorted(value, key=lambda x: safe_str(x))]
     if isinstance(value, (datetime, date)):
         return value.isoformat()
+    if isinstance(value, Decimal):
+        if value.is_nan() or value.is_infinite():
+            return safe_str(value, "")
+        if value == value.to_integral_value():
+            return int(value)
+        return float(value)
     if isinstance(value, bytes):
         try:
             return value.decode("utf-8", errors="replace")
@@ -537,6 +544,7 @@ class PostgresClient:
         paginas: Optional[int],
         palabras: int,
         updated_by: Optional[int],
+        estado: str = "EN_PROCESAMIENTO",
     ) -> Optional[Dict[str, Any]]:
         """Actualiza contenido OCR en GestorDocumental.Documentos."""
         sql = """
@@ -548,12 +556,14 @@ class PostgresClient:
           "calidadOcr" = COALESCE(%s, "calidadOcr"),
           "paginas" = COALESCE(%s, "paginas"),
           "palabras" = %s,
+          "estado" = %s,
           "updatedAt" = (CURRENT_TIMESTAMP AT TIME ZONE 'America/Bogota'),
           "updatedBy" = COALESCE(%s, "updatedBy")
         WHERE "id" = %s
         RETURNING
           "id" AS documento_id,
           "archivoNombre" AS archivo_nombre,
+          "estado" AS estado_documento,
           "ocrAplicado" AS ocr_aplicado,
           "calidadOcr" AS calidad_ocr,
           "paginas" AS paginas,
@@ -568,6 +578,43 @@ class PostgresClient:
                 safe_float(calidad_ocr, None),
                 safe_int(paginas, None),
                 int(max(0, safe_int(palabras, 0) or 0)),
+                safe_str(estado, "EN_PROCESAMIENTO"),
+                safe_int(updated_by, None),
+                int(documento_id),
+            ),
+        )
+
+    def update_documento_embedding_completion(
+        self,
+        documento_id: int,
+        metadata_patch: Dict[str, Any],
+        updated_by: Optional[int],
+        estado: str = "PROCESADO",
+    ) -> Optional[Dict[str, Any]]:
+        """Marca finalización de embeddings/chunking y actualiza metadatosExtra."""
+        sql = """
+        UPDATE "GestorDocumental"."Documentos"
+        SET
+          "embeddingGenerado" = true,
+          "procesado" = true,
+          "estado" = %s,
+          "metadatosExtra" = COALESCE("metadatosExtra"::jsonb, '{}'::jsonb) || %s::jsonb,
+          "updatedAt" = (CURRENT_TIMESTAMP AT TIME ZONE 'America/Bogota'),
+          "updatedBy" = COALESCE(%s, "updatedBy")
+        WHERE "id" = %s
+        RETURNING
+          "id" AS documento_id,
+          "archivoNombre" AS archivo_nombre,
+          "estado" AS estado_documento,
+          "embeddingGenerado" AS embedding_generado,
+          "procesado" AS procesado,
+          "updatedAt" AS updated_at
+        """
+        return self.execute_returning_one(
+            sql,
+            (
+                safe_str(estado, "PROCESADO"),
+                json_dumps_safe(metadata_patch),
                 safe_int(updated_by, None),
                 int(documento_id),
             ),
@@ -1900,6 +1947,7 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                 else request.embedding.created_by_default
             )
             ocr_update_info: Optional[Dict[str, Any]] = None
+            document_finalize_info: Optional[Dict[str, Any]] = None
             if documento_id is not None:
                 ocr_update_info = db.update_documento_ocr_text(
                     documento_id=documento_id,
@@ -1909,6 +1957,7 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                     paginas=ocr_pages,
                     palabras=ocr_words,
                     updated_by=ocr_updated_by,
+                    estado="EN_PROCESAMIENTO",
                 )
                 if ocr_update_info is None:
                     raise PipelineError(
@@ -1925,6 +1974,7 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                         "documento_id": documento_id,
                         "chars": len(text_for_chunking),
                         "palabras": ocr_words,
+                        "estado_documento": safe_str(ocr_update_info.get("estado_documento"), ""),
                         "service_endpoint": service_endpoint,
                     },
                 )
@@ -2193,6 +2243,77 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
             else:
                 recorder.push("PERSIST", "SKIPPED", "Persistencia no solicitada para este endpoint.")
 
+            # Finaliza estado documental al completar chunking + embeddings.
+            if run_embedding_stage:
+                if documento_id is not None:
+                    metadata_patch = {
+                        "ocr_embedding_pipeline": {
+                            "service_endpoint": service_endpoint,
+                            "stage": stage_key,
+                            "job_id": job_id,
+                            "job_filde_id": request.job_filde_id,
+                            "usuario_proceso": request.usuario_proceso,
+                            "job_proceso": request.job_proceso,
+                            "updated_at_utc": utc_now_iso(),
+                            "ocr": {
+                                "engine": engine,
+                                "chars": len(text_for_chunking),
+                                "palabras": ocr_words,
+                                "paginas": ocr_pages,
+                                "calidad_ocr": ocr_quality,
+                            },
+                            "chunking": {
+                                "strategy": chunking_method,
+                                "chunks_count": len(chunks),
+                            },
+                            "embedding": {
+                                "enabled": bool(run_embedding_stage),
+                                "model_name": request.embedding.model_name,
+                                "vectors_count": len(vectors),
+                                "save_to_db": bool(run_persist_stage),
+                                "inserted_rows": int(inserted_rows),
+                            },
+                        }
+                    }
+                    document_finalize_info = db.update_documento_embedding_completion(
+                        documento_id=documento_id,
+                        metadata_patch=metadata_patch,
+                        updated_by=ocr_updated_by,
+                        estado="PROCESADO",
+                    )
+                    if document_finalize_info is None:
+                        raise PipelineError(
+                            "DOCUMENT_FINALIZE",
+                            "DOCUMENT_NOT_UPDATED",
+                            "No fue posible marcar documento como PROCESADO al finalizar embeddings/chunking.",
+                            {"documento_id": documento_id, "service_endpoint": service_endpoint},
+                        )
+                    recorder.push(
+                        "DOCUMENT_FINALIZE",
+                        "OK",
+                        "Documento actualizado: embeddingGenerado=true, estado=PROCESADO, metadatosExtra actualizado.",
+                        {
+                            "documento_id": documento_id,
+                            "estado_documento": safe_str(document_finalize_info.get("estado_documento"), ""),
+                            "embedding_generado": safe_bool(document_finalize_info.get("embedding_generado"), False),
+                            "service_endpoint": service_endpoint,
+                        },
+                    )
+                else:
+                    recorder.push(
+                        "DOCUMENT_FINALIZE",
+                        "WARN",
+                        "No se marca documento como PROCESADO: documento_id_resuelto es null.",
+                        {"oid": int(request.oid), "service_endpoint": service_endpoint},
+                    )
+                update_job_progress(db, job_id, recorder, "RUNNING", "DOCUMENT_FINALIZE")
+            else:
+                recorder.push(
+                    "DOCUMENT_FINALIZE",
+                    "SKIPPED",
+                    "Actualizacion final de documento aplica solo en etapas con embeddings.",
+                )
+
             elapsed_ms = int((time.monotonic() - started) * 1000)
             result_data = {
                 "oid": int(request.oid),
@@ -2215,6 +2336,7 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                 "page_selection": page_info,
                 "cleaning": cleaning_meta,
                 "ocr_document_update": to_json_safe(ocr_update_info or {}),
+                "document_finalize_update": to_json_safe(document_finalize_info or {}),
                 "chunks_count": len(chunks),
                 "inserted_rows": inserted_rows,
                 "gpu": gpu_metrics(),
@@ -2254,8 +2376,17 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
 
     except PipelineError as exc:
         LOGGER.error("PipelineError phase=%s code=%s message=%s", exc.phase, exc.code, exc.message)
-        recorder.push(exc.phase, "ERROR", exc.message, exc.details)
-        error_payload = exc.to_dict()
+        trace_text = traceback.format_exc()
+        error_details = dict(exc.details or {})
+        if not error_details.get("traceback"):
+            error_details["traceback"] = trace_text
+        recorder.push(exc.phase, "ERROR", exc.message, error_details)
+        error_payload = {
+            "phase": exc.phase,
+            "code": exc.code,
+            "message": exc.message,
+            "details": error_details,
+        }
         if job_id is not None:
             try:
                 with PostgresClient(PostgresSettings.from_env()) as db_error:
@@ -2459,95 +2590,139 @@ def validate_db() -> Dict[str, Any]:
     result = _validate_db_connection()
     result["timestamp"] = bogota_now_iso()
     result["service"] = SERVICE_NAME
+    if safe_str(result.get("status"), "").lower() != "ok":
+        raise HTTPException(status_code=403, detail=to_json_safe(result))
     return to_json_safe(result)
+
+
+def _raise_forbidden(detail: Dict[str, Any]) -> None:
+    """Lanza HTTP 403 con detalle estructurado y serializable."""
+    raise HTTPException(status_code=403, detail=to_json_safe(detail))
+
+
+def _run_single_stage_or_403(payload: Dict[str, Any], stage: str) -> OCRChunkingResponse:
+    """Ejecuta una solicitud single-stage y eleva 403 con detalle completo si falla."""
+    input_payload = payload.get("input", payload)
+    try:
+        request = OCRChunkingRequest(**input_payload)
+    except Exception as exc:
+        _raise_forbidden(
+            {
+                "status": "FAILED",
+                "exitoso": False,
+                "stage": stage,
+                "message": "Payload invalido.",
+                "error": {
+                    "phase": "REQUEST_PARSING",
+                    "code": "INVALID_PAYLOAD",
+                    "message": f"{type(exc).__name__}: {str(exc)}",
+                    "details": {"traceback": traceback.format_exc()},
+                },
+                "input": to_json_safe(input_payload),
+            }
+        )
+
+    response = process_request(request, stage=stage)
+    if not response.exitoso:
+        _raise_forbidden(
+            {
+                "status": response.status,
+                "exitoso": response.exitoso,
+                "stage": stage,
+                "message": response.message,
+                "error": to_json_safe(response.error or {}),
+                "phases": to_json_safe(response.phases),
+                "data": to_json_safe(response.data),
+            }
+        )
+    return response
+
+
+def _run_batch_stage_or_403(payload: Dict[str, Any], stage: str) -> OCRChunkingBatchResponse:
+    """Ejecuta una solicitud batch y eleva 403 con detalle completo si falla/parcial."""
+    input_payload = payload.get("input", payload)
+    try:
+        request = OCRChunkingBatchRequest(**input_payload)
+    except Exception as exc:
+        _raise_forbidden(
+            {
+                "status": "FAILED",
+                "exitoso": False,
+                "stage": stage,
+                "message": "Payload batch invalido.",
+                "error": {
+                    "phase": "REQUEST_PARSING",
+                    "code": "INVALID_BATCH_PAYLOAD",
+                    "message": f"{type(exc).__name__}: {str(exc)}",
+                    "details": {"traceback": traceback.format_exc()},
+                },
+                "input": to_json_safe(input_payload),
+            }
+        )
+
+    response = process_batch(request, stage=stage)
+    if not response.exitoso:
+        _raise_forbidden(
+            {
+                "status": response.status,
+                "exitoso": response.exitoso,
+                "stage": stage,
+                "message": response.message,
+                "total": response.total,
+                "completados": response.completados,
+                "fallidos": response.fallidos,
+                "resultados": to_json_safe([pydantic_model_dump(r) for r in response.resultados]),
+            }
+        )
+    return response
 
 
 @app.post("/ocr-docling/process", response_model=OCRChunkingResponse, tags=[TAG_OCR])
 def ocr_docling_process(payload: Dict[str, Any]) -> OCRChunkingResponse:
     """Ejecuta solo OCR + limpieza de texto."""
-    input_payload = payload.get("input", payload)
-    try:
-        request = OCRChunkingRequest(**input_payload)
-    except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"Payload invalido: {str(exc)}") from exc
-    return process_request(request, stage="ocr")
+    return _run_single_stage_or_403(payload, stage="ocr")
 
 
 @app.post("/ocr-docling/process-batch", response_model=OCRChunkingBatchResponse, tags=[TAG_OCR])
 def ocr_docling_batch(payload: Dict[str, Any]) -> OCRChunkingBatchResponse:
     """Ejecuta OCR + limpieza para varios documentos."""
-    input_payload = payload.get("input", payload)
-    try:
-        request = OCRChunkingBatchRequest(**input_payload)
-    except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"Payload batch invalido: {str(exc)}") from exc
-    return process_batch(request, stage="ocr")
+    return _run_batch_stage_or_403(payload, stage="ocr")
 
 
 @app.post("/chunking-docling/process", response_model=OCRChunkingResponse, tags=[TAG_CHUNKING])
 def chunking_docling_process(payload: Dict[str, Any]) -> OCRChunkingResponse:
     """Ejecuta OCR + limpieza + chunking."""
-    input_payload = payload.get("input", payload)
-    try:
-        request = OCRChunkingRequest(**input_payload)
-    except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"Payload invalido: {str(exc)}") from exc
-    return process_request(request, stage="chunking")
+    return _run_single_stage_or_403(payload, stage="chunking")
 
 
 @app.post("/chunking-docling/process-batch", response_model=OCRChunkingBatchResponse, tags=[TAG_CHUNKING])
 def chunking_docling_batch(payload: Dict[str, Any]) -> OCRChunkingBatchResponse:
     """Ejecuta OCR + limpieza + chunking para varios documentos."""
-    input_payload = payload.get("input", payload)
-    try:
-        request = OCRChunkingBatchRequest(**input_payload)
-    except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"Payload batch invalido: {str(exc)}") from exc
-    return process_batch(request, stage="chunking")
+    return _run_batch_stage_or_403(payload, stage="chunking")
 
 
 @app.post("/embedding-generation/process", response_model=OCRChunkingResponse, tags=[TAG_EMBEDDING])
 def embedding_generation_process(payload: Dict[str, Any]) -> OCRChunkingResponse:
     """Ejecuta OCR + limpieza + chunking + generacion de embeddings."""
-    input_payload = payload.get("input", payload)
-    try:
-        request = OCRChunkingRequest(**input_payload)
-    except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"Payload invalido: {str(exc)}") from exc
-    return process_request(request, stage="embedding")
+    return _run_single_stage_or_403(payload, stage="embedding")
 
 
 @app.post("/embedding-generation/process-batch", response_model=OCRChunkingBatchResponse, tags=[TAG_EMBEDDING])
 def embedding_generation_batch(payload: Dict[str, Any]) -> OCRChunkingBatchResponse:
     """Ejecuta generacion de embeddings para varios documentos."""
-    input_payload = payload.get("input", payload)
-    try:
-        request = OCRChunkingBatchRequest(**input_payload)
-    except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"Payload batch invalido: {str(exc)}") from exc
-    return process_batch(request, stage="embedding")
+    return _run_batch_stage_or_403(payload, stage="embedding")
 
 
 @app.post("/PipelineOCR/process", response_model=OCRChunkingResponse, tags=[TAG_PIPELINE])
 def pipeline_ocr_process(payload: Dict[str, Any]) -> OCRChunkingResponse:
     """Orquesta todo el flujo: OCR, limpieza, chunking, embeddings e insercion."""
-    input_payload = payload.get("input", payload)
-    try:
-        request = OCRChunkingRequest(**input_payload)
-    except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"Payload invalido: {str(exc)}") from exc
-    return process_request(request, stage="pipeline")
+    return _run_single_stage_or_403(payload, stage="pipeline")
 
 
 @app.post("/PipelineOCR/process-batch", response_model=OCRChunkingBatchResponse, tags=[TAG_PIPELINE])
 def pipeline_ocr_batch(payload: Dict[str, Any]) -> OCRChunkingBatchResponse:
     """Orquesta flujo completo para varios documentos."""
-    input_payload = payload.get("input", payload)
-    try:
-        request = OCRChunkingBatchRequest(**input_payload)
-    except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"Payload batch invalido: {str(exc)}") from exc
-    return process_batch(request, stage="pipeline")
+    return _run_batch_stage_or_403(payload, stage="pipeline")
 
 
 def run_mock_local_demo(args: argparse.Namespace) -> None:
