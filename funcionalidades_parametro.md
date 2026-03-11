@@ -107,6 +107,12 @@ Descripcion de que hace cada parametro en el payload `input`.
 ## `cleaning.remove_isolated_numbers`
 - `true`: elimina lineas solo numericas.
 
+## `cleaning.remove_noisy_sentences`
+- `true`: elimina oraciones OCR con exceso de tokens cortos sin valor semantico.
+
+## `cleaning.noisy_min_alpha_tokens`, `cleaning.noisy_short_token_ratio`
+- Controlan el umbral para detectar ruido OCR.
+
 ## `cleaning.header_threshold`
 - Frecuencia para considerar encabezado repetido.
 
@@ -179,6 +185,7 @@ Descripcion de que hace cada parametro en el payload `input`.
 - `status`: `COMPLETED`, `ENQUEUED`, `FAILED`.
 - Errores HTTP: la API retorna `403` con detalle completo cuando hay falla de request o pipeline.
 - `error`: `{ phase, code, message, details }`.
+- En `data.ocr_confidence` se retorna confianza OCR completa (Docling o PyMuPDF probe).
 - Codigos frecuentes:
   - `OID_READ_FAILED`
   - `QUEUE_BUSY`

@@ -85,6 +85,7 @@ PAGE_INDICATOR_PATTERN = re.compile(
 )
 ISOLATED_NUMBER_PATTERN = re.compile(r"^[\d\s\.,\-/]+$")
 MULTI_EMPTY_LINES_PATTERN = re.compile(r"\n{3,}")
+WORD_TOKEN_PATTERN = re.compile(r"[A-Za-zÁÉÍÓÚáéíóúÜüÑñ]+", re.UNICODE)
 
 LOGGER = logging.getLogger("ocr_chunking")
 if not LOGGER.handlers:
@@ -146,6 +147,14 @@ def safe_bool(value: Any, default: bool = False) -> bool:
     if text in {"0", "false", "f", "no", "n", "off", ""}:
         return False
     return bool(default)
+
+
+def safe_len(value: Any) -> int:
+    """Safe len conversion."""
+    try:
+        return int(len(value))
+    except Exception:
+        return 0
 
 
 def to_json_dict(value: Any, default: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -918,6 +927,12 @@ class CleaningOptions(BaseModel):
     remove_headers: bool = Field(default=True)
     remove_isolated_numbers: bool = Field(default=True)
     header_threshold: int = Field(default=3, ge=2, le=20)
+    remove_noisy_sentences: bool = Field(
+        default=True,
+        description="Elimina oraciones con exceso de tokens cortos de bajo valor semantico.",
+    )
+    noisy_min_alpha_tokens: int = Field(default=8, ge=3, le=200)
+    noisy_short_token_ratio: float = Field(default=0.70, ge=0.0, le=1.0)
 
 
 class ChunkingOptions(BaseModel):
@@ -1217,6 +1232,185 @@ def extract_text_pymupdf(pdf_bytes: bytes) -> Tuple[str, int]:
     return "\n\n".join(parts).strip(), page_count
 
 
+def convertir_valor_confianza(value: Any) -> Any:
+    """Convierte valores de confianza Docling a tipos serializables."""
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        value = float(value)
+    if isinstance(value, (int, float)):
+        f = float(value)
+        if f != f or f in (float("inf"), float("-inf")):
+            return None
+        return round(f, 6)
+    if hasattr(value, "name"):
+        return safe_str(getattr(value, "name"), "").lower()
+    return value
+
+
+def extraer_confianza_docling(confidence_obj: Any) -> Dict[str, Any]:
+    """Extrae campos de confianza desde objetos de Docling."""
+    if confidence_obj is None:
+        return {"disponible": False}
+    return {
+        "mean_score": convertir_valor_confianza(getattr(confidence_obj, "mean_score", None)),
+        "mean_grade": convertir_valor_confianza(getattr(confidence_obj, "mean_grade", None)),
+        "low_score": convertir_valor_confianza(getattr(confidence_obj, "low_score", None)),
+        "low_grade": convertir_valor_confianza(getattr(confidence_obj, "low_grade", None)),
+        "layout_score": convertir_valor_confianza(getattr(confidence_obj, "layout_score", None)),
+        "ocr_score": convertir_valor_confianza(getattr(confidence_obj, "ocr_score", None)),
+        "parse_score": convertir_valor_confianza(getattr(confidence_obj, "parse_score", None)),
+        "table_score": convertir_valor_confianza(getattr(confidence_obj, "table_score", None)),
+        "disponible": True,
+    }
+
+
+def _resolve_docling_page_obj(document: Any, page_idx: int) -> Any:
+    """Resuelve objeto de pagina Docling para un indice 1-based."""
+    if document is None:
+        return None
+    pages = getattr(document, "pages", None)
+    if isinstance(pages, list) and pages:
+        pos = max(0, min(int(page_idx) - 1, len(pages) - 1))
+        return pages[pos]
+    if isinstance(pages, dict) and pages:
+        direct = pages.get(page_idx)
+        if direct is not None:
+            return direct
+        as_str = pages.get(safe_str(page_idx, ""))
+        if as_str is not None:
+            return as_str
+        values = list(pages.values())
+        if values:
+            pos = max(0, min(int(page_idx) - 1, len(values) - 1))
+            return values[pos]
+    return None
+
+
+def _extraer_metadata_pagina_docling(page_result: Any, pagina: int) -> Dict[str, Any]:
+    """Extrae metadata de una pagina incluyendo confianza e indicadores basicos."""
+    document = getattr(page_result, "document", None)
+    page_obj = _resolve_docling_page_obj(document, pagina)
+    size_obj = getattr(page_obj, "size", None) if page_obj is not None else None
+    confianza = extraer_confianza_docling(getattr(page_result, "confidence", None))
+    return {
+        "pagina": int(pagina),
+        "status_conversion": safe_str(getattr(page_result, "status", "UNKNOWN"), "UNKNOWN"),
+        "confianza_media_pagina": safe_float(confianza.get("mean_score"), None)
+        if isinstance(confianza, dict)
+        else None,
+        "confianza": confianza,
+        "ancho": safe_float(getattr(size_obj, "width", None), None) if size_obj is not None else None,
+        "alto": safe_float(getattr(size_obj, "height", None), None) if size_obj is not None else None,
+        "rotacion": safe_float(getattr(page_obj, "angle", None), None) if page_obj is not None else None,
+        "items_texto_detectados": safe_len(getattr(document, "texts", None)),
+        "tablas_detectadas": safe_len(getattr(document, "tables", None)),
+        "imagenes_detectadas": safe_len(getattr(document, "pictures", None)),
+    }
+
+
+def extract_docling_confidence_bundle(result: Any) -> Dict[str, Any]:
+    """Extrae confianza global y por pagina de Docling cuando esta disponible."""
+    global_conf = extraer_confianza_docling(getattr(result, "confidence", None))
+    page_entries: List[Dict[str, Any]] = []
+
+    result_pages = getattr(result, "pages", None)
+    if isinstance(result_pages, list) and result_pages:
+        for idx, page_result in enumerate(result_pages, start=1):
+            page_num = safe_int(getattr(page_result, "page_no", None), None)
+            if page_num is None:
+                page_num = safe_int(getattr(page_result, "page_number", None), idx)
+            page_entries.append(_extraer_metadata_pagina_docling(page_result, int(page_num or idx)))
+    elif isinstance(result_pages, dict) and result_pages:
+        sorted_items = sorted(result_pages.items(), key=lambda kv: safe_int(kv[0], 999999999))
+        for idx, (key, page_result) in enumerate(sorted_items, start=1):
+            page_num = safe_int(key, idx) or idx
+            page_entries.append(_extraer_metadata_pagina_docling(page_result, int(page_num)))
+    else:
+        # Fallback cuando Docling no expose pages en el resultado.
+        document = getattr(result, "document", None)
+        doc_pages = getattr(document, "pages", None)
+        if isinstance(doc_pages, list) and doc_pages:
+            for idx, page_obj in enumerate(doc_pages, start=1):
+                conf = extraer_confianza_docling(getattr(page_obj, "confidence", None))
+                size_obj = getattr(page_obj, "size", None)
+                page_entries.append(
+                    {
+                        "pagina": int(idx),
+                        "status_conversion": safe_str(getattr(result, "status", "UNKNOWN"), "UNKNOWN"),
+                        "confianza_media_pagina": safe_float(conf.get("mean_score"), None),
+                        "confianza": conf,
+                        "ancho": safe_float(getattr(size_obj, "width", None), None) if size_obj is not None else None,
+                        "alto": safe_float(getattr(size_obj, "height", None), None) if size_obj is not None else None,
+                        "rotacion": safe_float(getattr(page_obj, "angle", None), None),
+                        "items_texto_detectados": safe_len(getattr(document, "texts", None)),
+                        "tablas_detectadas": safe_len(getattr(document, "tables", None)),
+                        "imagenes_detectadas": safe_len(getattr(document, "pictures", None)),
+                    }
+                )
+        elif isinstance(doc_pages, dict) and doc_pages:
+            sorted_items = sorted(doc_pages.items(), key=lambda kv: safe_int(kv[0], 999999999))
+            for idx, (key, page_obj) in enumerate(sorted_items, start=1):
+                page_num = safe_int(key, idx) or idx
+                conf = extraer_confianza_docling(getattr(page_obj, "confidence", None))
+                size_obj = getattr(page_obj, "size", None)
+                page_entries.append(
+                    {
+                        "pagina": int(page_num),
+                        "status_conversion": safe_str(getattr(result, "status", "UNKNOWN"), "UNKNOWN"),
+                        "confianza_media_pagina": safe_float(conf.get("mean_score"), None),
+                        "confianza": conf,
+                        "ancho": safe_float(getattr(size_obj, "width", None), None) if size_obj is not None else None,
+                        "alto": safe_float(getattr(size_obj, "height", None), None) if size_obj is not None else None,
+                        "rotacion": safe_float(getattr(page_obj, "angle", None), None),
+                        "items_texto_detectados": safe_len(getattr(document, "texts", None)),
+                        "tablas_detectadas": safe_len(getattr(document, "tables", None)),
+                        "imagenes_detectadas": safe_len(getattr(document, "pictures", None)),
+                    }
+                )
+
+    mean_scores: List[float] = []
+    ocr_scores: List[float] = []
+    for page_meta in page_entries:
+        conf = page_meta.get("confianza")
+        if not isinstance(conf, dict):
+            continue
+        mean_value = safe_float(conf.get("mean_score"), None)
+        if mean_value is not None:
+            mean_scores.append(float(mean_value))
+        ocr_value = safe_float(conf.get("ocr_score"), None)
+        if ocr_value is not None:
+            ocr_scores.append(float(ocr_value))
+
+    summary = {
+        "pages_total": len(page_entries),
+        "pages_with_confidence": len([p for p in page_entries if safe_bool((p.get("confianza") or {}).get("disponible"), False)]),
+        "mean_score_avg": round(sum(mean_scores) / len(mean_scores), 6) if mean_scores else None,
+        "ocr_score_avg": round(sum(ocr_scores) / len(ocr_scores), 6) if ocr_scores else None,
+        "global_mean_score": safe_float(global_conf.get("mean_score"), None),
+        "global_ocr_score": safe_float(global_conf.get("ocr_score"), None),
+    }
+    selected_quality = (
+        summary["mean_score_avg"]
+        if summary["mean_score_avg"] is not None
+        else summary["global_mean_score"]
+    )
+    if selected_quality is None:
+        selected_quality = (
+            summary["ocr_score_avg"]
+            if summary["ocr_score_avg"] is not None
+            else summary["global_ocr_score"]
+        )
+    summary["selected_quality"] = selected_quality
+
+    return {
+        "global": global_conf,
+        "pages": page_entries,
+        "summary": summary,
+        "disponible": bool(page_entries or safe_bool(global_conf.get("disponible"), False)),
+    }
+
+
 def extract_text_docling(pdf_bytes: bytes, extraction: ExtractionOptions) -> Tuple[str, int, Dict[str, Any]]:
     """Extracts OCR text with Docling."""
     converter = load_docling_converter(
@@ -1254,12 +1448,59 @@ def extract_text_docling(pdf_bytes: bytes, extraction: ExtractionOptions) -> Tup
         if not text.strip():
             text = safe_str(getattr(document, "export_to_text", lambda: "")(), "")
         page_count = int(len(getattr(document, "pages", []) or []))
-        return text.strip(), page_count, {"conversion_status": status_str, "conversion_mode": "docling_ocr"}
+        confidence_bundle = extract_docling_confidence_bundle(result)
+        return text.strip(), page_count, {
+            "conversion_status": status_str,
+            "conversion_mode": "docling_ocr",
+            "docling_confidence": confidence_bundle,
+            "ocr_quality": safe_float((confidence_bundle.get("summary") or {}).get("selected_quality"), None),
+        }
     finally:
         try:
             os.remove(temp_path)
         except Exception:
             pass
+
+
+def sentence_is_noisy(sentence: str, min_alpha_tokens: int, short_ratio: float) -> bool:
+    """Detecta oraciones OCR ruidosas (muchos tokens alfabeticos muy cortos)."""
+    tokens = WORD_TOKEN_PATTERN.findall(safe_str(sentence, ""))
+    if len(tokens) < int(min_alpha_tokens):
+        return False
+    alpha_tokens = [tok for tok in tokens if tok]
+    if not alpha_tokens:
+        return False
+    short_count = sum(1 for tok in alpha_tokens if len(tok) <= 2)
+    long_count = sum(1 for tok in alpha_tokens if len(tok) >= 4)
+    ratio = float(short_count) / float(len(alpha_tokens))
+    return ratio >= float(short_ratio) and long_count <= max(2, int(len(alpha_tokens) * 0.25))
+
+
+def clean_noisy_sentences_in_line(line: str, min_alpha_tokens: int, short_ratio: float) -> Tuple[str, int]:
+    """Limpia segmentos ruidosos por linea conservando frases legibles."""
+    raw = safe_str(line, "")
+    if not raw.strip():
+        return raw, 0
+    segments = re.split(r"(?<=[\.\!\?\;\:])\s+", raw)
+    if not segments:
+        return raw, 0
+
+    kept: List[str] = []
+    removed = 0
+    for segment in segments:
+        piece = segment.strip()
+        if not piece:
+            continue
+        if sentence_is_noisy(piece, min_alpha_tokens=min_alpha_tokens, short_ratio=short_ratio):
+            removed += 1
+            continue
+        kept.append(piece)
+
+    if kept:
+        return " ".join(kept), removed
+    if sentence_is_noisy(raw, min_alpha_tokens=min_alpha_tokens, short_ratio=short_ratio):
+        return "", max(1, removed)
+    return raw, removed
 
 
 def clean_text(text: str, cleaning: CleaningOptions) -> Tuple[str, Dict[str, Any]]:
@@ -1292,6 +1533,20 @@ def clean_text(text: str, cleaning: CleaningOptions) -> Tuple[str, Dict[str, Any
     if cleaning.remove_isolated_numbers:
         lines = [line for line in lines if not ISOLATED_NUMBER_PATTERN.match(line.strip()) or not line.strip()]
 
+    removed_noisy_sentences = 0
+    if cleaning.remove_noisy_sentences:
+        filtered_lines: List[str] = []
+        for line in lines:
+            cleaned_line, removed_count = clean_noisy_sentences_in_line(
+                line=line,
+                min_alpha_tokens=int(cleaning.noisy_min_alpha_tokens),
+                short_ratio=float(cleaning.noisy_short_token_ratio),
+            )
+            removed_noisy_sentences += int(removed_count)
+            if cleaned_line.strip() or not line.strip():
+                filtered_lines.append(cleaned_line)
+        lines = filtered_lines
+
     merged = "\n".join(lines)
     merged = MULTI_EMPTY_LINES_PATTERN.sub("\n\n", merged).strip()
     return merged, {
@@ -1300,6 +1555,8 @@ def clean_text(text: str, cleaning: CleaningOptions) -> Tuple[str, Dict[str, Any
         "chars_after": len(merged),
         "remove_headers": bool(cleaning.remove_headers),
         "remove_isolated_numbers": bool(cleaning.remove_isolated_numbers),
+        "remove_noisy_sentences": bool(cleaning.remove_noisy_sentences),
+        "removed_noisy_sentences": int(removed_noisy_sentences),
     }
 
 
@@ -1913,6 +2170,14 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
             extraction_meta: Dict[str, Any] = {"engine": engine}
             if engine == "pymupdf":
                 extracted_text, extracted_pages = extract_text_pymupdf(selected_pdf)
+                extraction_meta["ocr_confidence"] = {
+                    "source": "pymupdf_probe",
+                    "extractable_confidence": safe_float(probe.get("extractable_confidence"), None),
+                    "is_text_extractable": safe_bool(probe.get("is_text_extractable"), False),
+                    "pages_sampled": safe_int(probe.get("sample_pages"), None),
+                    "text_page_ratio": safe_float(probe.get("text_page_ratio"), None),
+                    "image_ratio": safe_float(probe.get("image_ratio"), None),
+                }
             else:
                 extracted_text, extracted_pages, docling_meta = extract_text_docling(selected_pdf, request.extraction)
                 extraction_meta.update(docling_meta)
@@ -1925,6 +2190,10 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                 )
             extraction_meta.update(
                 {"chars": len(extracted_text), "pages_processed": extracted_pages, "engine_used": engine}
+            )
+            extraction_meta["ocr_quality"] = safe_float(
+                extraction_meta.get("ocr_quality"),
+                safe_float(probe.get("extractable_confidence"), None),
             )
             recorder.push("TEXT_EXTRACTION", "OK", "Extraccion completada.", extraction_meta)
             update_job_progress(db, job_id, recorder, "RUNNING", "TEXT_EXTRACTION")
@@ -1939,7 +2208,10 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
             # Persistencia temprana del OCR (texto extraido) en GestorDocumental.Documentos.
             ocr_words = count_words(text_for_chunking)
             ocr_hash = hashlib.sha256(text_for_chunking.encode("utf-8", errors="replace")).hexdigest()
-            ocr_quality = safe_float(probe.get("extractable_confidence"), None)
+            ocr_quality = safe_float(
+                extraction_meta.get("ocr_quality"),
+                safe_float(probe.get("extractable_confidence"), None),
+            )
             ocr_pages = safe_int(extraction_meta.get("pages_processed"), None)
             ocr_updated_by = (
                 request.created_by
@@ -2174,6 +2446,12 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                         "item_id": safe_int(item_info.get("item_id"), None) if item_info else None,
                         "probe": probe,
                         "engine_used": engine,
+                        "ocr_quality": safe_float(extraction_meta.get("ocr_quality"), None),
+                        "ocr_confidence": to_json_safe(
+                            extraction_meta.get("docling_confidence")
+                            or extraction_meta.get("ocr_confidence")
+                            or {}
+                        ),
                         "documento_id_resuelto": documento_id,
                         "documento_info": to_json_safe(documento_info or {}),
                         "oid_stats": to_json_safe(oid_stats or {}),
@@ -2261,6 +2539,12 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                                 "palabras": ocr_words,
                                 "paginas": ocr_pages,
                                 "calidad_ocr": ocr_quality,
+                                "probe": to_json_safe(probe),
+                                "confianza": to_json_safe(
+                                    extraction_meta.get("docling_confidence")
+                                    or extraction_meta.get("ocr_confidence")
+                                    or {}
+                                ),
                             },
                             "chunking": {
                                 "strategy": chunking_method,
@@ -2332,6 +2616,12 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                 "queue_name": queue_name if request.queue.enabled else None,
                 "binary_sha256": binary_sha256,
                 "engine_used": engine,
+                "ocr_quality": safe_float(extraction_meta.get("ocr_quality"), None),
+                "ocr_confidence": to_json_safe(
+                    extraction_meta.get("docling_confidence")
+                    or extraction_meta.get("ocr_confidence")
+                    or {}
+                ),
                 "probe": probe,
                 "page_selection": page_info,
                 "cleaning": cleaning_meta,
