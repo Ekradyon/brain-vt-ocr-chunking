@@ -1,199 +1,196 @@
 ﻿# funcionalidades_parametro
 
-Descripcion operativa de cada parametro del payload `input`.
-
-> Nota: cuando un parametro no se envia, se usa su default.
+Descripcion de que hace cada parametro en el payload `input`.
 
 ## Parametros principales
 
-## `oid`
-- Tipo: `int` (obligatorio)
-- Si se envia: busca ese `loOid` en `Operaciones.ItemsIngestaSmb` y procesa el PDF.
-- Si no se envia: error `422` (validacion).
-- Si no existe en BD: `FAILED` con `OID_NOT_FOUND`.
+## `oid` (obligatorio)
+- Tipo: `int`.
+- Funcion: identificador LOID para reconstruir el PDF desde `pg_largeobject`.
+- Regla: el servicio intenta resolver `documento_id` en `GestorDocumental.Documentos` por:
+  1) `metadatosExtra.ocr.metadata.oid`
+  2) fallback por `archivoNombre`.
+- Si no logra resolver `documento_id`, persiste con `documentoId=null` (si el esquema lo permite) y deja traza en fases.
+- Si no se envia: `422`.
+- Nota operativa: cuando se resuelve `documento_id`, el OCR limpio se escribe en `GestorDocumental.Documentos.contenidoTexto`.
+- Al finalizar OCR se actualiza `ocrAplicado=true` y `estado=EN_PROCESAMIENTO`.
+- Al finalizar embeddings/chunking (etapas con embeddings) se actualiza `embeddingGenerado=true`, `estado=PROCESADO` y `metadatosExtra`.
+
+## `nombre_documento`
+- Tipo: `string`.
+- Si se envia: se usa ese nombre y NO se busca nombre por OID en `ItemsIngestaSmb`.
+- Si no se envia: se intenta obtener `nombreArchivo` por OID; si no existe, usa nombre por defecto.
 
 ## `file_name`
-- Tipo: `string` (opcional)
-- Si se envia: se usa para trazabilidad y metadata.
-- Si no se envia: se intenta resolver desde `nombreArchivo` por `loOid`.
-
-## `documento_id`
-- Tipo: `int` (opcional)
-- Si se envia: permite persistencia en `IaCore.Embeddings`.
-- Si no se envia y `embedding.save_to_db=true` + `require_documento_id=true`: `FAILED` con `DOCUMENTO_ID_REQUIRED`.
+- Tipo: `string` (compatibilidad).
+- Se usa como alias de `nombre_documento` si este no viene.
 
 ## `job_filde_id`
-- Tipo: `int` (opcional)
-- Uso: trazabilidad de origen de job/archivo; se guarda en `jobFileId` en embeddings.
-- Si no se envia: se inserta `NULL` en `jobFileId`.
+- Tipo: `int` (opcional).
+- Se guarda como `jobFileId` en embeddings para trazabilidad.
+
+## `usuario_proceso`
+- Tipo: `string`.
+- Usuario funcional que lanza el proceso; se guarda en metadata de salida/embedding.
+
+## `job_proceso`
+- Tipo: `string`.
+- Nombre/identificador funcional del job de negocio; se guarda en metadata.
 
 ## `created_by`
-- Tipo: `int` (opcional)
-- Si se envia: se usa como `createdBy` de embeddings.
+- Tipo: `int`.
+- Usuario tecnico para columna `createdBy` en embeddings.
 - Si no se envia: usa `embedding.created_by_default`.
 
 ## `metadata`
-- Tipo: `objeto` (opcional)
-- Uso recomendado:
-  - `nombre_documento`
-  - `metadata_documento` (ej: `paginas`, `idioma`, `tipo`)
-  - `ruta_pdf`
-- Se agrega al metadata de salida y a los registros de embeddings.
+- Tipo: `objeto`.
+- Uso recomendado: metadatos adicionales de negocio.
+- Nota: la metadata tecnica principal (OID, stats LO, resolucion de documento, engine, pages/chunks) la calcula el servicio.
 
 ## queue
 
 ## `queue.enabled`
-- `true`: habilita control de cola (ensure, acquire, release, stats).
-- `false`: ejecuta directo sin semaforo de cola.
+- `true`: aplica cola y control de slots.
+- `false`: corre sin semaforo de cola.
 
 ## `queue.max_concurrency`
-- Entero 1..64.
-- Define la concurrencia maxima de la cola interna del servicio.
+- Entero de 1 a 64.
+- Define la concurrencia maxima de la cola.
 
 ## `queue.queue_when_busy`
-- `true`: si no hay slot disponible, retorna `ENQUEUED` y crea job `PENDIENTE`.
-- `false`: si no hay slot disponible, retorna `FAILED` con `QUEUE_BUSY`.
+- `true`: si la cola esta ocupada, retorna `ENQUEUED`.
+- `false`: si la cola esta ocupada, falla con `QUEUE_BUSY`.
 
 ## overwrite
 
 ## `overwrite.enabled`
-- `true`: borra embeddings existentes del `documento_id` antes de insertar.
-- `false`: si ya existen embeddings del documento, falla con `DUPLICATE_EMBEDDINGS`.
+- `true`: borra embeddings existentes del `documento_id` resuelto e inserta de nuevo.
+- `false`: si existen embeddings del `documento_id` resuelto, falla con `DUPLICATE_EMBEDDINGS`.
+- Si no hay `documento_id` resuelto: no hay validacion/borrado por documento y se registra warning.
 
-> Overwrite es solo a nivel documento (no hay scope).
+> Overwrite es unicamente a nivel documento.
 
 ## extraction
 
 ## `extraction.engine`
-- `auto`: decide entre `pymupdf` y `docling` segun confianza.
-- `pymupdf`: fuerza extraccion por PyMuPDF.
+- `auto`: decide PyMuPDF o Docling segun confianza.
+- `pymupdf`: fuerza PyMuPDF.
 - `docling`: fuerza OCR Docling.
 
 ## `extraction.enable_pymupdf_fast_path`
-- `true`: en `auto`, usa PyMuPDF cuando `extractable_confidence` supera umbral.
+- `true`: habilita ruta rapida PyMuPDF en `auto`.
 - `false`: en `auto`, usa Docling.
 
 ## `extraction.fast_path_confidence_threshold`
-- Rango `0..1`.
-- Umbral para considerar el PDF como texto extraible con alta confianza.
+- Umbral `0..1` para decidir fast path.
 
 ## `extraction.force_full_page_ocr`
-- `true`: prioriza OCR completo por Docling.
-- `false`: usa estrategia normal segun `engine`.
+- `true`: prioriza OCR completo Docling.
+- `false`: usa flujo normal.
 
 ## `extraction.page_mode`
 - `full`: procesa todo el documento.
-- `head_tail`: procesa primeras N y ultimas N paginas.
+- `head_tail`: procesa primeras y ultimas paginas.
 
 ## `extraction.head_pages`, `extraction.tail_pages`
-- Usados solo cuando `page_mode=head_tail`.
-
-## `extraction.probe_max_pages`
-- Numero maximo de paginas para calcular confianza de extraibilidad.
+- Cantidad de paginas para `head_tail`.
 
 ## cleaning
 
 ## `cleaning.enabled`
-- `true`: aplica limpieza previa al chunking.
-- `false`: usa texto bruto extraido.
+- `true`: limpia texto antes de chunking.
+- `false`: usa texto crudo.
 
 ## `cleaning.remove_headers`
-- `true`: elimina encabezados repetidos segun `header_threshold`.
-- `false`: conserva encabezados.
+- `true`: intenta remover encabezados repetidos.
 
 ## `cleaning.remove_isolated_numbers`
-- `true`: elimina lineas con solo numeros/simbolos numericos.
-- `false`: conserva lineas numericas sueltas.
+- `true`: elimina lineas solo numericas.
+
+## `cleaning.remove_noisy_sentences`
+- `true`: elimina oraciones OCR con exceso de tokens cortos sin valor semantico.
+
+## `cleaning.noisy_min_alpha_tokens`, `cleaning.noisy_short_token_ratio`
+- Controlan el umbral para detectar ruido OCR.
 
 ## `cleaning.header_threshold`
-- Frecuencia minima para considerar una linea como encabezado repetido.
+- Frecuencia para considerar encabezado repetido.
 
 ## chunking
 
 ## `chunking.strategy`
-- `semantic`: usa `HybridChunker` de Docling.
-- `simple`: usa ventanas por caracteres.
+- `semantic` o `simple`.
 
 ## `chunking.max_chunks`
 - `0`: sin limite.
-- `>0`: limita el numero final de chunks.
+- `>0`: limita total de chunks.
 
 ## `chunking.simple_chunk_size`
-- Tamano del chunk por caracteres para estrategia `simple`.
-- Tambien se usa para derivar `max_length` interno de embeddings.
+- Tamano por caracteres para estrategia simple.
+- Tambien ayuda a derivar `max_length` interno para embeddings.
 
 ## `chunking.simple_chunk_overlap`
-- Solape de caracteres entre chunks en estrategia `simple`.
+- Solape entre chunks en estrategia simple.
 
 ## `chunking.min_text_chars`
-- Umbral de advertencia; si texto queda por debajo, se emite warning y continua.
+- Si el texto queda por debajo, emite warning y continua.
 
 ## `chunking.enable_simple_fallback`
-- `true`: si semantic no produce chunks, intenta simple.
-- `false`: si semantic no produce chunks, falla con `EMPTY_CHUNKS`.
+- `true`: si semantic falla, usa simple.
+- `false`: si semantic falla, responde `EMPTY_CHUNKS`.
 
 ## embedding
 
 ## `embedding.enabled`
 - `true`: genera embeddings.
-- `false`: no genera embeddings (util para endpoints OCR/Chunking).
+- `false`: no genera embeddings.
 
 ## `embedding.model_name`
-- Nombre del modelo HuggingFace usado para embeddings.
+- Modelo de embeddings.
 
 ## `embedding.batch_size`
-- Cantidad de chunks por lote al generar embeddings.
-- `batch_size` alto: mas velocidad potencial, mayor uso de memoria GPU/CPU.
-- `batch_size` bajo: menor uso de memoria, mayor tiempo total.
+- Numero de chunks por lote durante embedding.
+- Alto: mas rapido potencialmente, mayor memoria.
+- Bajo: menor memoria, mas tiempo.
 
 ## `embedding.save_to_db`
-- `true`: inserta embeddings en `IaCore.Embeddings`.
-- `false`: no inserta (solo calcula si aplica).
+- `true`: inserta en `IaCore.Embeddings`.
+- `false`: no inserta.
 
 ## `embedding.return_vectors`
-- `true`: incluye vectores en la respuesta HTTP.
-- `false`: no devuelve vectores (respuesta mas liviana).
-
-## `embedding.require_documento_id`
-- `true`: exige `documento_id` para persistencia.
-- `false`: no lo exige (no recomendado para insercion real).
+- `true`: retorna vectores en respuesta.
+- `false`: no retorna vectores.
 
 ## `embedding.require_inserted_rows`
-- `true`: falla si no se inserta ninguna fila.
-- `false`: permite continuar aunque no haya insercion.
+- `true`: falla si no inserta filas.
+- `false`: permite respuesta exitosa sin insercion.
 
 ## `embedding.created_by_default`
-- Valor fallback para `createdBy` si `created_by` no se envio.
+- Fallback de `created_by`.
 
 ## mock
 
 ## `mock.enabled`
-- `true`: ejecuta pipeline simulado sin DB real.
-- `false`: ejecuta pipeline real.
+- `true`: simula flujo sin DB real.
+- `false`: flujo real.
 
 ## `mock.fail_phase`
-- Si se define, fuerza error en la fase indicada (solo mock).
+- Fuerza error en la fase indicada (solo mock).
 
 ## `mock.latency_ms`
-- Agrega latencia artificial por fase (solo mock).
-
-## `mock.without_db`
-- Indicador documental de ejecucion sin DB en modo mock.
+- Latencia artificial por fase (solo mock).
 
 ## Estado y errores de salida
 
 - `status`: `COMPLETED`, `ENQUEUED`, `FAILED`.
-- `error` incluye:
-  - `phase`
-  - `code`
-  - `message`
-  - `details`
+- Errores HTTP: la API retorna `403` con detalle completo cuando hay falla de request o pipeline.
+- `error`: `{ phase, code, message, details }`.
+- En `data.ocr_confidence` se retorna confianza OCR completa (Docling o PyMuPDF probe).
+- Codigos frecuentes:
+  - `OID_READ_FAILED`
+  - `QUEUE_BUSY`
+  - `DUPLICATE_EMBEDDINGS`
+  - `EMPTY_EXTRACTED_TEXT`
+  - `EMPTY_CHUNKS`
+  - `NO_ROWS_INSERTED`
 
-Codigos frecuentes:
-- `OID_NOT_FOUND`
-- `QUEUE_BUSY`
-- `DOCUMENTO_ID_REQUIRED`
-- `DUPLICATE_EMBEDDINGS`
-- `EMPTY_EXTRACTED_TEXT`
-- `EMPTY_CHUNKS`
-- `NO_ROWS_INSERTED`
