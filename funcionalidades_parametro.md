@@ -6,12 +6,12 @@ Descripcion de que hace cada parametro en el payload `input`.
 
 ## `oid` (obligatorio)
 - Tipo: `int`.
-- Funcion: identificador LOID para reconstruir el PDF desde `pg_largeobject`.
+- Funcion: identificador LOID para reconstruir el archivo desde `pg_largeobject`.
 - Regla: el servicio intenta resolver `documento_id` en `GestorDocumental.Documentos` por:
   1) `metadatosExtra.ocr.metadata.oid`
   2) fallback por `archivoNombre`.
 - Si no logra resolver `documento_id`, persiste con `documentoId=null` (si el esquema lo permite) y deja traza en fases.
-- Si no se envia: `422`.
+- Si no se envia: error HTTP `403` con detalle de validacion.
 - Nota operativa: cuando se resuelve `documento_id`, el OCR limpio se escribe en `GestorDocumental.Documentos.contenidoTexto`.
 - Al finalizar OCR se actualiza `ocrAplicado=true` y `estado=EN_PROCESAMIENTO`.
 - Al finalizar embeddings/chunking (etapas con embeddings) se actualiza `embeddingGenerado=true`, `estado=PROCESADO` y `metadatosExtra`.
@@ -24,6 +24,12 @@ Descripcion de que hace cada parametro en el payload `input`.
 ## `file_name`
 - Tipo: `string` (compatibilidad).
 - Se usa como alias de `nombre_documento` si este no viene.
+
+## `mime_type`
+- Tipo: `string`.
+- Formato esperado: `application/pdf` (u otro soportado por Docling en este servicio).
+- Si no viene, se intenta resolver por metadata, GestorDocumental o extension.
+- Si no es soportado, el proceso falla y marca documento en `PENDIENTE_PROCESAMIENTO`.
 
 ## `job_filde_id`
 - Tipo: `int` (opcional).
@@ -68,7 +74,13 @@ Descripcion de que hace cada parametro en el payload `input`.
 - `false`: si existen embeddings del `documento_id` resuelto, falla con `DUPLICATE_EMBEDDINGS`.
 - Si no hay `documento_id` resuelto: no hay validacion/borrado por documento y se registra warning.
 
-> Overwrite es unicamente a nivel documento.
+## `overwrite.allow_duplicate_hash`
+- `false` (default): si existe otro documento `PROCESADO` con mismo `contenidoHash`, falla.
+- `true`: permite continuar aunque exista hash duplicado.
+
+## `overwrite.allow_reprocess_processed`
+- `false` (default): si el documento ya esta en estado `PROCESADO`, no se reprocesa.
+- `true`: permite reprocesar documento ya procesado.
 
 ## extraction
 
@@ -76,6 +88,19 @@ Descripcion de que hace cada parametro en el payload `input`.
 - `auto`: decide PyMuPDF o Docling segun confianza.
 - `pymupdf`: fuerza PyMuPDF.
 - `docling`: fuerza OCR Docling.
+- Nota: `pymupdf` solo aplica cuando `mime_type=application/pdf`.
+
+## MIME soportados por el servicio
+- `application/pdf`
+- `application/vnd.openxmlformats-officedocument.wordprocessingml.document` (DOCX)
+- `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` (XLSX)
+- `application/vnd.openxmlformats-officedocument.presentationml.presentation` (PPTX)
+- `text/markdown`, `text/x-markdown`
+- `text/asciidoc`, `text/x-asciidoc`
+- `text/x-tex`, `application/x-latex`
+- `text/html`, `application/xhtml+xml`
+- `text/csv`
+- `image/png`, `image/jpeg`, `image/tiff`, `image/bmp`, `image/webp`
 
 ## `extraction.enable_pymupdf_fast_path`
 - `true`: habilita ruta rapida PyMuPDF en `auto`.
@@ -185,7 +210,7 @@ Descripcion de que hace cada parametro en el payload `input`.
 - `status`: `COMPLETED`, `ENQUEUED`, `FAILED`.
 - Errores HTTP: la API retorna `403` con detalle completo cuando hay falla de request o pipeline.
 - `error`: `{ phase, code, message, details }`.
-- En `data.ocr_confidence` se retorna confianza OCR completa (Docling o PyMuPDF probe).
+- En `data.ocr_confidence` se retorna confianza OCR sintetica (sin detalle por pagina).
 - Codigos frecuentes:
   - `OID_READ_FAILED`
   - `QUEUE_BUSY`
